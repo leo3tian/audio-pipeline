@@ -82,7 +82,6 @@ def run_emilia_pipe(input_wav: str, output_dir: str, device: str):
     source {conda_setup} && \
     conda activate {conda_env} && \
     export TORCH_HOME="/tmp/torch_cache_{device}" && \
-    export CUDA_VISIBLE_DEVICES={device} && \
     python -c "import torch; torch.cuda.set_per_process_memory_fraction(0.8, 0)" && \
     python {emilia_script} --input_folder_path '{input_wav}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}'
     """
