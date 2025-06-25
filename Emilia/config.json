@@ -17,7 +17,7 @@
     },
     "separate": {
         "step1": {
-            "model_path": "models/UVR-MDX-NET-Inst_HQ_3.onnx",
+            "model_path": "Emilia/models/UVR-MDX-NET-Inst_HQ_3.onnx",
             "denoise": true,
             "margin": 44100,
             "chunks": 15,
@@ -27,7 +27,7 @@
         }
     },
     "mos_model": { 
-        "primary_model_path": "models/sig_bak_ovr.onnx"
+        "primary_model_path": "Emilia/models/sig_bak_ovr.onnx"
     },
     "huggingface_token": "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"
 }
