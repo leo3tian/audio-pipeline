@@ -24,6 +24,18 @@ RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
     /opt/conda/bin/conda run -n AudioPipeline pip install yt-dlp && \
     /opt/conda/bin/conda run -n AudioPipeline bash -c "cd Emilia && bash env.sh"
 
+# --- Auto-activate Conda environment on login ---
+# By adding these commands to /root/.profile, they will be executed
+# automatically every time a login shell starts. Your original
+# ENTRYPOINT ["/bin/bash", "-l"] starts a login shell, which is perfect.
+RUN { \
+        echo; \
+        echo '# Activate AudioPipeline Conda environment'; \
+        echo 'source /opt/conda/etc/profile.d/conda.sh'; \
+        echo 'conda activate AudioPipeline'; \
+        echo 'echo "*** Conda environment \"AudioPipeline\" is now active. ***"'; \
+    } >> /root/.profile
+
 # --- Set working dir & launch shell ---
 WORKDIR /workspace
 ENTRYPOINT ["/bin/bash", "-l"]
