@@ -7,7 +7,7 @@ from pathlib import Path
 from yt_dlp import YoutubeDL
 from hf_upload import upload_to_huggingface # We import our new upload function
 
-# --- Configuration ---
+# Config
 # Path to the master list of URLs created by collect_urls.py.
 # On a cloud platform, this would be a path to the file in a shared volume, e.g., '/mnt/s3/master_url_list.txt'.
 URL_LIST_FILE = "master_url_list.txt" 
@@ -16,13 +16,12 @@ EMILIA_WORKERS = 6 # Max number of GPUs to use
 EMILIA_PIPE_PATH = "Emilia/main.py"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
 # Hugging Face repo details for the upload.
-HF_REPO_ID = "YourUsername/YourAudioDataset"
+HF_REPO_ID = "TO-DO"
 
 
 def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     """
     Runs the Emilia-pipe on a specific audio file using a specific GPU.
-    This function is largely the same as your original one.
     """
     print(f"GPU {device} - Processing file: {input_wav_file}")
     os.makedirs(output_dir, exist_ok=True)
@@ -31,7 +30,6 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     conda_env = "AudioPipeline"
     emilia_script = os.path.abspath(EMILIA_PIPE_PATH)
     
-    # --- DEBUGGING FIX: Command now uses --input_file_path for clarity and efficiency ---
     cmd = f"""
     source {conda_setup} && \
     conda activate {conda_env} && \
@@ -56,7 +54,7 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
         # Decode stderr to print the actual error from the Emilia script
         error_message = e.stderr.decode()
         print(f"[!] Emilia error on GPU {device} for {input_wav_file}:\n---\n{error_message}\n---")
-        raise # Re-raise exception to be caught by the worker loop
+        raise
 
 def processing_worker(url_queue: multiprocessing.JoinableQueue, device: str):
     """
@@ -65,7 +63,7 @@ def processing_worker(url_queue: multiprocessing.JoinableQueue, device: str):
     """
     while True:
         video_url = url_queue.get()
-        if video_url is None: # Sentinel value to signal process termination.
+        if video_url is None:
             url_queue.task_done()
             break
         
