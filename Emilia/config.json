@@ -29,5 +29,5 @@
     "mos_model": { 
         "primary_model_path": "Emilia/models/sig_bak_ovr.onnx"
     },
-    "huggingface_token": "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"
+    "huggingface_token": "hf_PLACEHOLDER - Set huggingface token in .env"
 }

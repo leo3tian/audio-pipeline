@@ -2,8 +2,9 @@
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 # --- System packages ---
+# Add aws-cli so we can run `aws configure`
 RUN apt update && apt install -y \
-    git wget ffmpeg curl build-essential bzip2 libsndfile1 python3 python3-pip && \
+    git wget ffmpeg curl build-essential bzip2 libsndfile1 python3 python3-pip aws-cli && \
     rm -rf /var/lib/apt/lists/*
 
 # --- Install Conda ---
@@ -17,19 +18,15 @@ WORKDIR /workspace
 COPY . .
 
 # --- Create Conda env and install dependencies ---
-# This now includes huggingface_hub for the uploader
+# Added boto3 for AWS S3 access
 RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
-    /opt/conda/bin/conda run -n AudioPipeline pip install yt-dlp huggingface_hub datasets && \
+    /opt/conda/bin/conda run -n AudioPipeline pip install yt-dlp huggingface_hub datasets boto3 && \
     /opt/conda/bin/conda run -n AudioPipeline bash -c "cd Emilia && bash env.sh"
 
-# --- RECOMMENDED CHANGE: Pre-cache models to prevent race conditions ---
-# This runs our new script inside the conda environment to download models
-# into the Docker image layer itself.
+# --- Pre-cache models to prevent race conditions ---
 RUN /opt/conda/envs/AudioPipeline/bin/python cache_models.py
 
 # --- Auto-activate Conda environment on login ---
-# By adding these commands to /root/.profile, they will be executed
-# automatically every time a login shell starts.
 RUN { \
         echo; \
         echo '# Activate AudioPipeline Conda environment'; \
@@ -39,6 +36,4 @@ RUN { \
 
 # --- Set working dir & default command ---
 WORKDIR /workspace
-# Set the default command to be a bash shell for interactive use.
-# For automated runs, this can be overridden.
 CMD ["/bin/bash", "-l"]

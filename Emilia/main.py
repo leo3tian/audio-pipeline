@@ -524,6 +524,7 @@ if __name__ == "__main__":
 
     batch_size = args.batch_size
     cfg = load_cfg(args.config_path)
+    cfg["huggingface_token"] = os.getenv("HF_TOKEN")
 
     # Set up logger
     logger = Logger.get_logger()
