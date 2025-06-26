@@ -39,8 +39,7 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     python {emilia_script} \
         --input_file_path '{input_wav_file}' \
         --config_path '{EMILIA_CONFIG_PATH}' \
-        --output_dir '{output_dir}' \
-        --quiet
+        --output_dir '{output_dir}'
     """
     try:
         # Using DEVNULL for stdout to keep logs clean, stderr is piped for error checking.
