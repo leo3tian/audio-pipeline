@@ -2,15 +2,19 @@
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 # --- System packages ---
-# Fix: First, enable the 'universe' repository which contains aws-cli, then install.
 # Using apt-get which is better for scripting.
+# We'll install most packages, and handle aws-cli separately.
 RUN apt-get update -qq && \
-    apt-get install -y -qq software-properties-common && \
-    add-apt-repository -y universe && \
-    apt-get update -qq && \
     apt-get install -y -qq \
-    git wget ffmpeg curl build-essential bzip2 libsndfile1 python3 python3-pip aws-cli && \
+    git wget ffmpeg curl build-essential bzip2 libsndfile1 python3 python3-pip unzip && \
     rm -rf /var/lib/apt/lists/*
+
+# --- Install AWS CLI v2 ---
+# Using the official AWS installer is more reliable than apt-get in some base images.
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
+    unzip awscliv2.zip && \
+    ./aws/install && \
+    rm -rf awscliv2.zip aws
 
 # --- Install Conda ---
 RUN wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh && \
