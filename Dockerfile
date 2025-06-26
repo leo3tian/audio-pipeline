@@ -2,8 +2,13 @@
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 # --- System packages ---
-# Add aws-cli so we can run `aws configure`
-RUN apt update && apt install -y \
+# Fix: First, enable the 'universe' repository which contains aws-cli, then install.
+# Using apt-get which is better for scripting.
+RUN apt-get update -qq && \
+    apt-get install -y -qq software-properties-common && \
+    add-apt-repository -y universe && \
+    apt-get update -qq && \
+    apt-get install -y -qq \
     git wget ffmpeg curl build-essential bzip2 libsndfile1 python3 python3-pip aws-cli && \
     rm -rf /var/lib/apt/lists/*
 
