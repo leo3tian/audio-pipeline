@@ -10,32 +10,35 @@ RUN apt update && apt install -y \
 RUN wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh && \
     bash Miniforge3-Linux-x86_64.sh -b -p /opt/conda && \
     rm Miniforge3-Linux-x86_64.sh
-#RUN wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh && \
-#    bash Miniforge3-Linux-aarch64.sh -b -p /opt/conda && \
-#    rm Miniforge3-Linux-aarch64.sh
 ENV PATH="/opt/conda/bin:$PATH"
 
 # --- Copy your entire project ---
 WORKDIR /workspace
 COPY . .
 
-# --- Create and set up Conda env for Emilia and downloader ---
+# --- Create Conda env and install dependencies ---
+# This now includes huggingface_hub for the uploader
 RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
-    /opt/conda/bin/conda run -n AudioPipeline pip install yt-dlp && \
+    /opt/conda/bin/conda run -n AudioPipeline pip install yt-dlp huggingface_hub datasets && \
     /opt/conda/bin/conda run -n AudioPipeline bash -c "cd Emilia && bash env.sh"
+
+# --- RECOMMENDED CHANGE: Pre-cache models to prevent race conditions ---
+# This runs our new script inside the conda environment to download models
+# into the Docker image layer itself.
+RUN /opt/conda/envs/AudioPipeline/bin/python cache_models.py
 
 # --- Auto-activate Conda environment on login ---
 # By adding these commands to /root/.profile, they will be executed
-# automatically every time a login shell starts. Your original
-# ENTRYPOINT ["/bin/bash", "-l"] starts a login shell, which is perfect.
+# automatically every time a login shell starts.
 RUN { \
         echo; \
         echo '# Activate AudioPipeline Conda environment'; \
         echo 'source /opt/conda/etc/profile.d/conda.sh'; \
         echo 'conda activate AudioPipeline'; \
-        echo 'echo "*** Conda environment \"AudioPipeline\" is now active. ***"'; \
     } >> /root/.profile
 
-# --- Set working dir & launch shell ---
+# --- Set working dir & default command ---
 WORKDIR /workspace
-ENTRYPOINT ["/bin/bash", "-l"]
+# Set the default command to be a bash shell for interactive use.
+# For automated runs, this can be overridden.
+CMD ["/bin/bash", "-l"]
