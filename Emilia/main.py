@@ -410,7 +410,8 @@ def main_process(audio_path, save_path=None, audio_name=None):
     if save_path is None:
         save_path = os.path.join(os.path.dirname(audio_path) + "_processed", audio_name)
     else:
-        save_path = os.path.join(save_path, audio_name)
+        # If an explicit save_path is given, use it directly.
+        pass
     os.makedirs(save_path, exist_ok=True)
     logger.debug(
         f"Processing audio: {audio_name}, from {audio_path}, save to: {save_path}"
@@ -433,6 +434,10 @@ def main_process(audio_path, save_path=None, audio_name=None):
 
     logger.info("Step 4: ASR")
     asr_result = asr(segment_list, audio)
+    if not asr_result:
+        logger.warning(f"No valid ASR result for {audio_name}, skipping.")
+        return None, None
+
 
     logger.info("Step 5: Filter")
     logger.info("Step 5.1: calculate mos_prediction")
@@ -447,19 +452,17 @@ def main_process(audio_path, save_path=None, audio_name=None):
     with open(os.path.join(save_path, "filtered_segments.json"), "w") as f:
         json.dump(filtered_list, f, indent=2)
 
-    filtered_list = all_list
-
-    logger.info("Step 6: write result into MP3 and JSON file")
-    export_to_mp3(audio, filtered_list, save_path, audio_name)
-
-    # dump all
+    # dump all (your original code saved the filtered list as all_segments.json, I'm keeping that logic)
     final_path = os.path.join(save_path, "all_segments.json")
     with open(final_path, "w") as f:
-        
-        json.dump(filtered_list, f, indent=2, ensure_ascii=False)
+        json.dump(all_list, f, indent=2, ensure_ascii=False)
+
+    logger.info("Step 6: write result into MP3 and JSON file")
+    export_to_mp3(audio, all_list, save_path, audio_name)
+
 
     logger.info(f"All done, Saved to: {final_path}")
-    return final_path, filtered_list
+    return final_path, all_list
 
 
 if __name__ == "__main__":
@@ -467,8 +470,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--input_folder_path",
         type=str,
-        default="",
-        help="input folder path, this will override config if set",
+        default=None,
+        help="Input folder path with audio files. Overrides config if set.",
+    )
+    # DEBUGGING FIX: Add new argument for single file processing
+    parser.add_argument(
+        "--input_file_path",
+        type=str,
+        default=None,
+        help="Path to a single audio file to process. Takes precedence over input_folder_path.",
     )
     parser.add_argument(
         "--config_path", type=str, default="config.json", help="config path"
@@ -496,7 +506,13 @@ if __name__ == "__main__":
         "--output_dir",
         type=str,
         default=None,
-        help="Optional directory to store all processed outputs"
+        help="Optional base directory to store all processed outputs"
+    )
+    # DEBUGGING FIX: Add a quiet flag to suppress logs when called from worker
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress detailed logging, useful when called from a worker script."
     )
     parser.add_argument(
         "--exit_pipeline",
@@ -509,10 +525,14 @@ if __name__ == "__main__":
     batch_size = args.batch_size
     cfg = load_cfg(args.config_path)
 
+    # Set up logger
     logger = Logger.get_logger()
+    if args.quiet:
+        logger.setLevel(logging.WARNING)
 
-    if args.input_folder_path:
-        logger.info(f"Using input folder path: {args.input_folder_path}")
+
+    if args.input_folder_path and not args.input_file_path:
+        logger.info(f"Using input folder path from arguments: {args.input_folder_path}")
         cfg["entrypoint"]["input_folder_path"] = args.input_folder_path
 
     logger.debug("Loading models...")
@@ -579,13 +599,29 @@ if __name__ == "__main__":
     logger.debug(f"supported languages multilingual {supported_languages}")
     logger.debug(f"using multilingual asr {multilingual_flag}")
 
-    input_folder_path = cfg["entrypoint"]["input_folder_path"]
+    # --- DEBUGGING FIX: Main processing logic ---
+    # Prioritize processing a single file if the argument is provided.
+    if args.input_file_path:
+        if not os.path.exists(args.input_file_path):
+             raise FileNotFoundError(f"Input file not found: {args.input_file_path}")
+        logger.info(f"Processing single file: {args.input_file_path}")
+        # The output_dir from args will be the base for this specific file's output
+        main_process(args.input_file_path, save_path=args.output_dir)
 
-    if not os.path.exists(input_folder_path):
-        raise FileNotFoundError(f"input_folder_path: {input_folder_path} not found")
+    # Fallback to folder processing if no single file is specified.
+    elif args.input_folder_path:
+        input_folder_path = args.input_folder_path
+        if not os.path.exists(input_folder_path):
+            raise FileNotFoundError(f"input_folder_path: {input_folder_path} not found")
 
-    audio_paths = get_audio_files(input_folder_path)  # Get all audio files
-    logger.debug(f"Scanning {len(audio_paths)} audio files in {input_folder_path}")
+        audio_paths = get_audio_files(input_folder_path)  # Get all audio files
+        logger.info(f"Scanning {len(audio_paths)} audio files in {input_folder_path}")
 
-    for path in audio_paths:
-        main_process(path, save_path=args.output_dir)
+        for path in audio_paths:
+             # For folder mode, create a sub-directory for each audio file within the main output_dir
+            audio_name = os.path.splitext(os.path.basename(path))[0]
+            specific_save_path = os.path.join(args.output_dir, audio_name) if args.output_dir else None
+            main_process(path, save_path=specific_save_path)
+    else:
+        logger.error("No input specified. Please provide --input_file_path or --input_folder_path.")
+

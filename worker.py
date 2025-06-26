@@ -19,36 +19,44 @@ EMILIA_CONFIG_PATH = "Emilia/config.json"
 HF_REPO_ID = "YourUsername/YourAudioDataset"
 
 
-def run_emilia_pipe(input_wav_dir: str, output_dir: str, device: str):
+def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     """
-    Runs the Emilia-pipe on a downloaded audio file using a specific GPU.
+    Runs the Emilia-pipe on a specific audio file using a specific GPU.
     This function is largely the same as your original one.
     """
-    print(f"GPU {device} - Processing folder: {input_wav_dir}")
+    print(f"GPU {device} - Processing file: {input_wav_file}")
     os.makedirs(output_dir, exist_ok=True)
 
     conda_setup = "/opt/conda/etc/profile.d/conda.sh"
     conda_env = "AudioPipeline"
     emilia_script = os.path.abspath(EMILIA_PIPE_PATH)
     
+    # --- DEBUGGING FIX: Command now uses --input_file_path for clarity and efficiency ---
     cmd = f"""
     source {conda_setup} && \
     conda activate {conda_env} && \
     export CUDA_VISIBLE_DEVICES={device} && \
-    python {emilia_script} --input_folder_path '{input_wav_dir}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}' --quiet
+    python {emilia_script} \
+        --input_file_path '{input_wav_file}' \
+        --config_path '{EMILIA_CONFIG_PATH}' \
+        --output_dir '{output_dir}' \
+        --quiet
     """
     try:
-        subprocess.run(
+        # Using DEVNULL for stdout to keep logs clean, stderr is piped for error checking.
+        process = subprocess.run(
             cmd,
             shell=True,
             executable="/bin/bash",
             check=True,
-            stdout=subprocess.PIPE, # Capture stdout to check for success messages if needed
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE
         )
-        print(f"GPU {device} - ✅ Successfully processed: {input_wav_dir}")
+        print(f"GPU {device} - ✅ Successfully processed: {input_wav_file}")
     except subprocess.CalledProcessError as e:
-        print(f"[!] Emilia error on GPU {device} for {input_wav_dir}:\n{e.stderr.decode()}")
+        # Decode stderr to print the actual error from the Emilia script
+        error_message = e.stderr.decode()
+        print(f"[!] Emilia error on GPU {device} for {input_wav_file}:\n---\n{error_message}\n---")
         raise # Re-raise exception to be caught by the worker loop
 
 def processing_worker(url_queue: multiprocessing.JoinableQueue, device: str):
@@ -67,10 +75,8 @@ def processing_worker(url_queue: multiprocessing.JoinableQueue, device: str):
         with tempfile.TemporaryDirectory(prefix="audiopipe_") as temp_dir:
             try:
                 temp_path = Path(temp_dir)
-                download_dir = temp_path / "download"
+                # The output from emilia will go into a 'processed' sub-folder inside the temp dir
                 processed_dir = temp_path / "processed"
-                os.makedirs(download_dir)
-                os.makedirs(processed_dir)
 
                 # --- 1. DOWNLOAD ---
                 print(f"GPU {device} - Downloading: {video_url}")
@@ -78,7 +84,8 @@ def processing_worker(url_queue: multiprocessing.JoinableQueue, device: str):
                     'format': 'bestaudio/best',
                     'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav'}],
                     'postprocessor_args': ['-ar', str(SAMPLE_RATE)],
-                    'outtmpl': str(download_dir / '%(id)s.%(ext)s'),
+                    # Download directly into the temp directory
+                    'outtmpl': str(temp_path / '%(id)s.%(ext)s'),
                     'quiet': True,
                     'ignoreerrors': True,
                 }
@@ -86,12 +93,14 @@ def processing_worker(url_queue: multiprocessing.JoinableQueue, device: str):
                     ydl.download([video_url])
 
                 # Find the downloaded WAV file. Should only be one.
-                downloaded_files = list(download_dir.glob("*.wav"))
+                downloaded_files = list(temp_path.glob("*.wav"))
                 if not downloaded_files:
-                    raise FileNotFoundError("yt-dlp failed to download the WAV file.")
+                    raise FileNotFoundError(f"yt-dlp failed to download the WAV file for URL: {video_url}")
                 
+                input_wav_path = str(downloaded_files[0])
+
                 # --- 2. PROCESS ---
-                run_emilia_pipe(str(download_dir), str(processed_dir), device)
+                run_emilia_pipe(input_wav_path, str(processed_dir), device)
                 
                 # --- 3. UPLOAD ---
                 print(f"GPU {device} - Uploading results for: {video_url}")
