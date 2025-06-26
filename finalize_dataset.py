@@ -10,7 +10,7 @@ import io
 S3_BUCKET_NAME = "yt-pipeline-bucket"
 S3_PREFIX = "processed/"
 HF_REPO_ID = "leo-fixie/conversational-podcasts"
-HF_TOKEN = None 
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 def finalize_and_upload():
     """
