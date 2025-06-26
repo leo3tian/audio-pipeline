@@ -11,6 +11,7 @@ import sys
 import os
 import tqdm
 import warnings
+import logging
 import torch
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
@@ -529,7 +530,7 @@ if __name__ == "__main__":
     # Set up logger
     logger = Logger.get_logger()
     if args.quiet:
-        logger.setLevel(logger.WARNING)
+        logger.setLevel(logging.WARNING)
 
 
     if args.input_folder_path and not args.input_file_path:
