@@ -1,11 +1,12 @@
 import os
 import subprocess
 import multiprocessing
+import threading
+import queue # Using the thread-safe queue for internal communication
 import tempfile
-import shutil
 from pathlib import Path
 from yt_dlp import YoutubeDL
-import boto3 # Import the AWS SDK
+import boto3
 
 # --- Configuration ---
 URL_LIST_FILE = "master_url_list.txt" 
@@ -13,19 +14,9 @@ SAMPLE_RATE = 24000
 EMILIA_WORKERS = 6 
 EMILIA_PIPE_PATH = "Emilia/main.py"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
-# The name of the S3 bucket you created.
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "yt-pipeline-bucket")
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "your-bucket-name-here")
 
-
-def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str):
-    """Uploads the contents of a directory to a specific S3 prefix."""
-    s3_client = boto3.client("s3")
-    for local_file in local_directory.rglob("*"):
-        if local_file.is_file():
-            s3_key = f"{s3_prefix}/{local_file.relative_to(local_directory)}"
-            print(f"    Uploading {local_file.name} to s3://{s3_bucket}/{s3_key}")
-            s3_client.upload_file(str(local_file), s3_bucket, s3_key)
-
+# --- CORE PROCESSING FUNCTIONS (UNCHANGED) ---
 
 def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     """Runs the Emilia-pipe on a specific audio file using a specific GPU."""
@@ -36,7 +27,7 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     emilia_script = os.path.abspath(EMILIA_PIPE_PATH)
     cmd = f"""
     source {conda_setup} && conda activate {conda_env} && export CUDA_VISIBLE_DEVICES={device} && \
-    python {emilia_script} --input_file_path '{input_wav_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}' --quiet
+    python {emilia_script} --input_file_path '{input_wav_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}'
     """
     try:
         subprocess.run(cmd, shell=True, executable="/bin/bash", check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -46,48 +37,116 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
         print(f"[!] Emilia error on GPU {device} for {input_wav_file}:\n---\n{error_message}\n---")
         raise
 
-def processing_worker(url_queue: multiprocessing.JoinableQueue, device: str):
-    """Worker downloads, processes, and uploads results to S3."""
+def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str):
+    """Uploads the contents of a directory to a specific S3 prefix."""
+    s3_client = boto3.client("s3")
+    for local_file in local_directory.rglob("*"):
+        if local_file.is_file():
+            s3_key = f"{s3_prefix}/{local_file.relative_to(local_directory)}"
+            s3_client.upload_file(str(local_file), s3_bucket, s3_key)
+    print(f"    Uploaded results to s3://{s3_bucket}/{s3_prefix}")
+
+
+# --- NEW MULTI-THREADED WORKER LOGIC ---
+
+def downloader_task(urls_to_download: list, ready_queue: queue.Queue):
+    """
+    This function runs in a separate thread. Its only job is to download
+    files and put their info onto the 'ready_queue' for the processor.
+    """
+    for video_url in urls_to_download:
+        # Each download gets its own temporary directory
+        temp_dir = tempfile.mkdtemp(prefix="audiopipe_")
+        try:
+            print(f"Downloader - Starting download for: {video_url}")
+            temp_path = Path(temp_dir)
+            
+            ydl_opts = {
+                'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav'}],
+                'postprocessor_args': ['-ar', str(SAMPLE_RATE)], 'outtmpl': str(temp_path / '%(id)s.%(ext)s'),
+                'quiet': True, 'ignoreerrors': True,
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                video_id = info.get('id', 'unknown_video')
+
+            downloaded_files = list(temp_path.glob("*.wav"))
+            if not downloaded_files:
+                raise FileNotFoundError(f"yt-dlp failed to download WAV for: {video_url}")
+            
+            # Put the result on the queue for the processor.
+            # This is a tuple containing everything the processor needs.
+            ready_queue.put((str(downloaded_files[0]), video_id, temp_dir))
+            
+        except Exception as e:
+            print(f"[!!!] DOWNLOADER FAILURE for URL {video_url}: {e}")
+            # Clean up the temp directory if download fails
+            if os.path.exists(temp_dir):
+                Path(temp_dir).rmdir()
+
+def processor_task(ready_queue: queue.Queue, device: str):
+    """
+    This function runs in a separate thread, dedicated to the GPU. Its only job
+    is to wait for items on the 'ready_queue', process them, and upload them.
+    """
     while True:
-        video_url = url_queue.get()
-        if video_url is None:
-            url_queue.task_done()
-            break
+        try:
+            # This will block and wait until an item is available on the queue.
+            item = ready_queue.get()
+            
+            # A 'None' item is a sentinel value that signals the end of the work.
+            if item is None:
+                break
+            
+            input_wav_path, video_id, temp_dir = item
+            temp_path = Path(temp_dir)
+            emilia_output_dir = temp_path / "processed"
+
+            # --- 2. PROCESS ---
+            run_emilia_pipe(input_wav_path, str(emilia_output_dir), device)
+            
+            # --- 3. UPLOAD TO S3 ---
+            s3_prefix = f"processed/{video_id}"
+            print(f"GPU {device} - Uploading results for {video_id} to S3...")
+            upload_directory_to_s3(emilia_output_dir, S3_BUCKET_NAME, s3_prefix)
         
-        with tempfile.TemporaryDirectory(prefix="audiopipe_") as temp_dir:
-            try:
-                temp_path = Path(temp_dir)
-                emilia_output_dir = temp_path / "processed"
+        except Exception as e:
+            print(f"[!!!] PROCESSOR FAILURE on GPU {device} for video {video_id}: {e}")
+        finally:
+            # Clean up the entire temporary directory for the video
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                Path(temp_dir).rmdir()
+            # Signal that this task from the queue is finished.
+            ready_queue.task_done()
 
-                # --- 1. DOWNLOAD ---
-                print(f"GPU {device} - Downloading: {video_url}")
-                ydl_opts = {
-                    'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav'}],
-                    'postprocessor_args': ['-ar', str(SAMPLE_RATE)], 'outtmpl': str(temp_path / '%(id)s.%(ext)s'),
-                    'quiet': True, 'ignoreerrors': True,
-                }
-                with YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(video_url, download=True)
-                    video_id = info.get('id', 'unknown_video')
+def master_worker_process(urls_for_this_worker: list, device: str):
+    """
+    This is the main target function for each process (one per GPU).
+    It orchestrates the downloader and processor threads.
+    """
+    print(f"Starting master worker for GPU {device} with {len(urls_for_this_worker)} URLs.")
+    # This queue has a max size of 2, acting as a small buffer.
+    # The downloader will wait if it gets more than 2 files ahead of the processor.
+    ready_to_process_queue = queue.Queue(maxsize=2)
 
-                downloaded_files = list(temp_path.glob("*.wav"))
-                if not downloaded_files:
-                    raise FileNotFoundError(f"yt-dlp failed to download WAV for: {video_url}")
-                
-                input_wav_path = str(downloaded_files[0])
+    downloader = threading.Thread(target=downloader_task, args=(urls_for_this_worker, ready_to_process_queue))
+    processor = threading.Thread(target=processor_task, args=(ready_to_process_queue, device))
 
-                # --- 2. PROCESS ---
-                run_emilia_pipe(input_wav_path, str(emilia_output_dir), device)
-                
-                # --- 3. UPLOAD TO S3 ---
-                s3_prefix = f"processed/{video_id}"
-                print(f"GPU {device} - 💾 Uploading results for {video_id} to S3...")
-                upload_directory_to_s3(emilia_output_dir, S3_BUCKET_NAME, s3_prefix)
-                
-            except Exception as e:
-                print(f"[!!!] CRITICAL FAILURE on GPU {device} for URL {video_url}: {e}")
-            finally:
-                url_queue.task_done()
+    downloader.start()
+    processor.start()
+
+    # Wait for the downloader to finish putting all items on the queue.
+    downloader.join()
+    
+    # Put a sentinel value on the queue to signal the processor to stop.
+    ready_to_process_queue.put(None)
+    
+    # Wait for the processor to finish its last task.
+    processor.join()
+    print(f"Master worker for GPU {device} has finished.")
+
+
+# --- MAIN ORCHESTRATION (Similar to before) ---
 
 def get_available_gpus() -> list:
     """Detects available NVIDIA GPU indices."""
@@ -99,7 +158,7 @@ def get_available_gpus() -> list:
         return ["0"]
 
 def main():
-    """Orchestrates the worker pool."""
+    """Orchestrates the pool of master worker processes."""
     try:
         with open(URL_LIST_FILE, "r") as f:
             urls = [line.strip() for line in f if line.strip()]
@@ -110,26 +169,23 @@ def main():
         print(f"[!] Error: URL file not found: '{URL_LIST_FILE}'. Run 'collect_urls.py' first.")
         return
 
-    url_queue = multiprocessing.JoinableQueue()
-    for url in urls:
-        url_queue.put(url)
-
     processes = []
     available_devices = get_available_gpus()[:EMILIA_WORKERS]
     if not available_devices:
         print("[!] No GPUs detected. Aborting.")
         return
         
-    print(f"🚀 Starting {len(available_devices)} worker processes for {len(urls)} videos...")
-    for device in available_devices:
-        p = multiprocessing.Process(target=processing_worker, args=(url_queue, device))
+    num_devices = len(available_devices)
+    # Split the master URL list into chunks for each worker process
+    url_chunks = [urls[i::num_devices] for i in range(num_devices)]
+    
+    print(f"🚀 Starting {num_devices} master worker processes for {len(urls)} videos...")
+    
+    for i, device in enumerate(available_devices):
+        p = multiprocessing.Process(target=master_worker_process, args=(url_chunks[i], device))
         p.start()
         processes.append(p)
 
-    for _ in processes:
-        url_queue.put(None)
-
-    url_queue.join()
     for p in processes:
         p.join()
 

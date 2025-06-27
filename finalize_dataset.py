@@ -11,7 +11,7 @@ import math
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
 S3_PREFIX = "processed/"
-HF_REPO_ID = os.environ.get("HF_REPO_ID", "leo-fixie/conversational-podcasts")
+HF_REPO_ID = os.environ.get("HF_REPO_ID", "leo-fixie/videos-test")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 # New: Define how many audio files go into each .tar archive
 FILES_PER_TAR_BATCH = 5000 
