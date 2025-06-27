@@ -14,7 +14,7 @@ SAMPLE_RATE = 24000
 EMILIA_WORKERS = 6 
 EMILIA_PIPE_PATH = "Emilia/main.py"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
-S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "your-bucket-name-here")
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
 
 # --- CORE PROCESSING FUNCTIONS (UNCHANGED) ---
 
@@ -38,13 +38,20 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
         raise
 
 def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str):
-    """Uploads the contents of a directory to a specific S3 prefix."""
+    """Uploads the contents of a directory to a specific S3 prefix with cleaner logs."""
     s3_client = boto3.client("s3")
-    for local_file in local_directory.rglob("*"):
+    # Convert generator to list to get the count and iterate
+    files_to_upload = list(local_directory.rglob("*"))
+    file_count = len(files_to_upload)
+    
+    print(f"    Uploading {file_count} files to s3://{s3_bucket}/{s3_prefix}...")
+    
+    for local_file in files_to_upload:
         if local_file.is_file():
             s3_key = f"{s3_prefix}/{local_file.relative_to(local_directory)}"
             s3_client.upload_file(str(local_file), s3_bucket, s3_key)
-    print(f"    Uploaded results to s3://{s3_bucket}/{s3_prefix}")
+            
+    print(f"    Finished uploading to s3://{s3_bucket}/{s3_prefix}")
 
 
 # --- NEW MULTI-THREADED WORKER LOGIC ---
