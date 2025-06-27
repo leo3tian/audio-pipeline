@@ -14,7 +14,7 @@ CHANNEL_URLS = [
     # Add other channels to process here...
 ]
 
-S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://your-bucket-name-here/streaming_dataset") 
+S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset") 
 SAMPLE_RATE = 24000
 NUM_WORKERS = 16
 
