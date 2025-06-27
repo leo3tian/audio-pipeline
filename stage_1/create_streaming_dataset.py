@@ -10,8 +10,7 @@ import random
 
 # --- Configuration ---
 CHANNEL_URLS = [
-    "https://www.youtube.com/@CodeAesthetic",
-    # Add other channels to process here...
+    "https://www.youtube.com/@tkppodcast",
 ]
 
 S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset") 
