@@ -1,5 +1,7 @@
 import os
 import subprocess
+import tempfile
+from pathlib import Path
 from streaming import MDSWriter
 from yt_dlp import YoutubeDL
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +14,7 @@ CHANNEL_URLS = [
     # Add other channels to process here...
 ]
 
-S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset") 
+S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://your-bucket-name-here/streaming_dataset") 
 SAMPLE_RATE = 24000
 NUM_WORKERS = 16
 
@@ -23,71 +25,80 @@ DATASET_COLUMNS = {
     'sample_rate': 'int'
 }
 
-# --- yt-dlp Configuration ---
-# Updated to use a cookies file for authentication
-YDL_OPTS = {
-    'format': 'bestaudio/best',
-    'quiet': True,
-    'ignoreerrors': True,
-    'cookiefile': '/home/ec2-user/cookies.txt' # Points to the cookies file on the EC2 instance
-}
-
 def download_and_write_to_stream(video_url: str, writer: MDSWriter):
     """
-    Gets a direct audio URL, pipes it through ffmpeg for on-the-fly conversion
-    to WAV format, and writes the resulting audio bytes to the MDSWriter.
-    This method avoids saving temporary audio files to disk.
+    Downloads an audio file to a temporary local disk, converts it using ffmpeg,
+    and writes the resulting audio bytes to the MDSWriter. This method is more stable
+    than in-memory streaming for ffmpeg.
     """
-    try:
-        # Step 1: Get metadata and the direct URL of the best audio stream
-        print(f"Fetching metadata for: {video_url}")
-        with YoutubeDL(YDL_OPTS) as ydl:
-            # The extract_info call will now use the cookies
-            info_dict = ydl.extract_info(video_url, download=False)
-            if not info_dict:
-                raise ValueError("yt-dlp returned no info, possibly due to an error handled internally.")
-            
-            audio_url = info_dict.get('url')
-            video_id = info_dict.get('id', 'unknown')
-            if not audio_url:
-                raise ValueError("Could not extract direct audio URL.")
-
-        # Step 2: Use ffmpeg to stream and convert the audio in memory
-        print(f"  Streaming and converting: {video_id}")
-        ffmpeg_command = [
-            'ffmpeg',
-            '-i', audio_url,
-            '-f', 'wav',
-            '-ar', str(SAMPLE_RATE),
-            '-ac', '1',
-            '-'
-        ]
-        
-        # FIX: Added try/except block to handle ffmpeg crashes gracefully
+    # Create a unique temporary directory for this download
+    with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            process = subprocess.run(ffmpeg_command, capture_output=True, check=True)
-            audio_bytes = process.stdout
-            if not audio_bytes:
-                raise ValueError("ffmpeg produced no output bytes.")
-        except subprocess.CalledProcessError as e:
-            # This will catch ffmpeg crashes (like the SIGSEGV error)
-            error_output = e.stderr.decode() if e.stderr else "No stderr output"
-            raise RuntimeError(f"ffmpeg failed with exit code {e.returncode}: {error_output}")
-
-        # Step 3: Write the in-memory audio bytes to the streaming dataset
-        sample = {
-            'video_id': video_id,
-            'audio': audio_bytes,
-            'sample_rate': SAMPLE_RATE
-        }
-        writer.write(sample)
-        print(f"  ✅ Wrote {video_id} to stream.")
-
-        # Add a small random delay to mimic human behavior
-        time.sleep(random.uniform(1, 3))
+            temp_path = Path(temp_dir)
             
-    except Exception as e:
-        print(f"[ERROR] Failed to process {video_url}: {e}")
+            # --- yt-dlp Configuration to download to our temp directory ---
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'quiet': True,
+                'ignoreerrors': True,
+                'cookiefile': '/home/ec2-user/cookies.txt',
+                # Set the output template to save inside our temp dir
+                'outtmpl': str(temp_path / '%(id)s.%(ext)s'),
+            }
+
+            # Step 1: Download the full audio file to the local disk
+            print(f"Downloading: {video_url}")
+            with YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(video_url, download=True)
+                if not info_dict:
+                    raise ValueError("yt-dlp returned no info.")
+                
+                video_id = info_dict.get('id', 'unknown')
+                # Find the path to the downloaded file
+                downloaded_filepath = ydl.prepare_filename(info_dict)
+
+                if not os.path.exists(downloaded_filepath):
+                     raise FileNotFoundError(f"Could not find downloaded file at {downloaded_filepath}")
+
+            # Step 2: Use ffmpeg to convert the local file
+            print(f"  Converting: {video_id}")
+            output_wav_bytes = convert_audio_to_wav(downloaded_filepath)
+
+            # Step 3: Write the audio bytes to the streaming dataset
+            sample = {
+                'video_id': video_id,
+                'audio': output_wav_bytes,
+                'sample_rate': SAMPLE_RATE
+            }
+            writer.write(sample)
+            print(f"  ✅ Wrote {video_id} to stream.")
+
+            # Add a small random delay to mimic human behavior
+            time.sleep(random.uniform(1, 3))
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to process {video_url}: {e}")
+        # The 'with tempfile.TemporaryDirectory()' block automatically cleans up the temp_dir
+
+def convert_audio_to_wav(local_filepath: str) -> bytes:
+    """
+    Converts a local audio file to WAV format in memory using ffmpeg.
+    """
+    ffmpeg_command = [
+        'ffmpeg',
+        '-i', local_filepath,   # Input from the stable local file
+        '-f', 'wav',            # Output format is WAV
+        '-ar', str(SAMPLE_RATE),   # Resample to our target sample rate
+        '-ac', '1',             # Convert to mono
+        '-'                     # Output to stdout
+    ]
+    try:
+        process = subprocess.run(ffmpeg_command, capture_output=True, check=True)
+        return process.stdout
+    except subprocess.CalledProcessError as e:
+        error_output = e.stderr.decode() if e.stderr else "No stderr output"
+        raise RuntimeError(f"ffmpeg failed with exit code {e.returncode} for file {local_filepath}: {error_output}")
+
 
 def main():
     """
@@ -97,7 +108,9 @@ def main():
     # 1. Collect all video URLs from all channels
     print("Collecting all video URLs...")
     all_video_urls = []
-    flat_opts = {'extract_flat': True, 'quiet': True, 'ignoreerrors': True, 'cookiefile': YDL_OPTS['cookiefile']}
+    # We still need cookies for the initial URL collection
+    cookie_path = '/home/ec2-user/cookies.txt'
+    flat_opts = {'extract_flat': True, 'quiet': True, 'ignoreerrors': True, 'cookiefile': cookie_path}
     with YoutubeDL(flat_opts) as ydl:
         for channel_url in CHANNEL_URLS:
             try:
