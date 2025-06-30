@@ -64,13 +64,13 @@ def processing_worker(rank: int, world_size: int, device: str):
         full_dataset = StreamingDataset(
             remote=S3_INPUT_DIR,
             local=local_cache_dir,
-            shuffle=False
+            shuffle=False,
+            # FIX: Add the required batch_size argument. Since we process one
+            # sample at a time, our batch size is 1.
+            batch_size=1
         )
 
-        # FIX: Create a unique slice of the dataset for this worker using islice.
-        # This is more robust than passing rank/world_size to the constructor.
-        # For example, with 4 workers, worker 0 gets samples 0, 4, 8, ...
-        # and worker 1 gets samples 1, 5, 9, ...
+        # Create a unique slice of the dataset for this worker using islice.
         dataset_slice = islice(full_dataset, rank, None, world_size)
 
         # Iterate over the unique slice of the dataset assigned to this worker
@@ -78,6 +78,7 @@ def processing_worker(rank: int, world_size: int, device: str):
             # The global index is rank + i * world_size
             global_index = rank + (i * world_size)
             video_id = sample['video_id']
+            # The audio from the streaming dataset is already in bytes
             audio_bytes = sample['audio']
             sample_rate = sample['sample_rate']
             
@@ -90,7 +91,12 @@ def processing_worker(rank: int, world_size: int, device: str):
                     
                     # Save the audio bytes from the sample to a temporary .wav file
                     input_wav_path = temp_path / f"{video_id}.wav"
-                    sf.write(input_wav_path, audio_bytes, sample_rate, format='WAV', subtype='PCM_16')
+                    # The audio is already in bytes, so we write it directly.
+                    # The soundfile library expects a numpy array, not raw bytes.
+                    # We need to decode the WAV bytes first.
+                    # Assuming the bytes are a valid WAV file, we can write them directly.
+                    with open(input_wav_path, 'wb') as f:
+                        f.write(audio_bytes)
 
                     # --- 2. PROCESS with Emilia-pipe ---
                     run_emilia_pipe(str(input_wav_path), str(emilia_output_dir), device)
