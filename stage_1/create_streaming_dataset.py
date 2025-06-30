@@ -1,135 +1,160 @@
 import os
 import subprocess
-import multiprocessing
 import tempfile
-import shutil
 from pathlib import Path
-import boto3
-from streaming import StreamingDataset
-import soundfile as sf
+from streaming import MDSWriter
+from yt_dlp import YoutubeDL
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import random
+import threading
+import itertools
+import shutil
 
 # --- Configuration ---
-# This is the S3 path to the raw audio dataset created by Stage 1.
-S3_INPUT_DIR = os.getenv("S3_INPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset")
-# This is the S3 path where the processed results will be saved.
-S3_OUTPUT_DIR = os.getenv("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/processed")
+CHANNEL_URLS = [
+    "https://www.youtube.com/@tkppodcast/videos",
+]
 
-EMILIA_WORKERS = 4 # Number of GPUs to use
-EMILIA_PIPE_PATH = "Emilia/main.py"
-EMILIA_CONFIG_PATH = "Emilia/config.json"
+S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset") 
+SAMPLE_RATE = 24000
+NUM_WORKERS = 4
+FAILED_URLS_LOG = "failed_urls.log"
+COOLDOWN_PERIOD_SECONDS = 60
 
-def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str):
-    """Uploads the contents of a directory to a specific S3 prefix with cleaner logs."""
-    s3_client = boto3.client("s3")
-    files_to_upload = list(local_directory.rglob("*"))
-    file_count = len(files_to_upload)
-    
-    print(f"    Uploading {file_count} files to s3://{s3_bucket}/{s3_prefix}...")
-    
-    for local_file in files_to_upload:
-        if local_file.is_file():
-            s3_key = f"{s3_prefix}/{local_file.relative_to(local_directory)}"
-            s3_client.upload_file(str(local_file), s3_bucket, s3_key)
-            
-    print(f"    Finished uploading to s3://{s3_bucket}/{s3_prefix}")
+# --- Synchronization objects for rate-limiting cooldown ---
+cooldown_event = threading.Event()
+cooldown_event.set()
+cooldown_lock = threading.Lock()
 
-def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
-    """Runs the Emilia-pipe on a specific audio file using a specific GPU."""
-    print(f"GPU {device} - Processing file: {input_wav_file}")
-    os.makedirs(output_dir, exist_ok=True)
-    conda_setup = "/opt/conda/etc/profile.d/conda.sh"
-    conda_env = "AudioPipeline"
-    emilia_script = os.path.abspath(EMILIA_PIPE_PATH)
-    cmd = f"""
-    source {conda_setup} && conda activate {conda_env} && export CUDA_VISIBLE_DEVICES={device} && \
-    python {emilia_script} --input_file_path '{input_wav_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}'
+# Define the columns (schema) for the raw audio dataset
+DATASET_COLUMNS = {
+    'video_id': 'str',
+    'audio': 'bytes',
+    'sample_rate': 'int'
+}
+
+def download_and_write_to_stream(video_url: str, writer: MDSWriter, task_num: int, temp_dir: Path):
     """
+    Downloads and converts a single video's audio, writing it to the stream.
+    Now uses a shared temporary directory to avoid race conditions.
+    """
+    cooldown_event.wait()
+    
+    # Use a unique subdirectory within the shared temp_dir for this specific task
+    task_temp_path = temp_dir / f"task_{task_num}"
+    os.makedirs(task_temp_path, exist_ok=True)
+
     try:
-        subprocess.run(cmd, shell=True, executable="/bin/bash", check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        print(f"GPU {device} - ✅ Successfully processed: {input_wav_file}")
+        ydl_opts = {
+            'format': 'bestaudio/best', 'quiet': True, 'ignoreerrors': True,
+            'cookiefile': '/home/ec2-user/cookies.txt',
+            'outtmpl': str(task_temp_path / '%(id)s.%(ext)s'),
+        }
+
+        # Step 1: Download the full audio file
+        with YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(video_url, download=True)
+            if not info_dict:
+                raise ValueError("yt-dlp returned no info, likely due to a download error.")
+            
+            video_id = info_dict.get('id', 'unknown')
+            downloaded_filepath = ydl.prepare_filename(info_dict)
+
+            if not os.path.exists(downloaded_filepath):
+                 raise FileNotFoundError(f"Could not find downloaded file at {downloaded_filepath}")
+
+        # Step 2: Convert the local file using ffmpeg
+        output_wav_bytes = convert_audio_to_wav(downloaded_filepath)
+
+        # Step 3: Write to the streaming dataset
+        sample = {
+            'video_id': video_id,
+            'audio': output_wav_bytes,
+            'sample_rate': SAMPLE_RATE
+        }
+        writer.write(sample)
+        print(f"  ✅ [Video #{task_num}] Wrote {video_id} to stream.")
+
+        time.sleep(random.uniform(1, 3))
+    finally:
+        # Clean up the specific task's subdirectory
+        shutil.rmtree(task_temp_path, ignore_errors=True)
+
+
+def convert_audio_to_wav(local_filepath: str) -> bytes:
+    """Converts a local audio file to WAV format in memory using ffmpeg."""
+    ffmpeg_command = [
+        'ffmpeg', '-i', local_filepath, '-f', 'wav',
+        '-ar', str(SAMPLE_RATE), '-ac', '1', '-'
+    ]
+    try:
+        process = subprocess.run(ffmpeg_command, capture_output=True, check=True, timeout=300)
+        return process.stdout
     except subprocess.CalledProcessError as e:
-        error_message = e.stderr.decode()
-        print(f"[!] Emilia error on GPU {device} for {input_wav_file}:\n---\n{error_message}\n---")
-        raise
-
-def processing_worker(rank: int, world_size: int, device: str):
-    """
-    A worker process that reads a unique shard of the StreamingDataset,
-    processes each sample, and uploads the result to a new S3 prefix.
-    """
-    # Each worker initializes the dataset. The library handles sharding based on rank and world_size.
-    # The `local` parameter tells the library where to cache downloaded shards.
-    with tempfile.TemporaryDirectory() as local_cache_dir:
-        dataset = StreamingDataset(
-            remote=S3_INPUT_DIR,
-            local=local_cache_dir,
-            shuffle=False, # Important for ensuring each worker gets a unique set
-            num_canonical_nodes=world_size,
-            rank=rank
-        )
-
-        # Iterate over the unique shard of the dataset assigned to this worker
-        for i, sample in enumerate(dataset):
-            video_id = sample['video_id']
-            audio_bytes = sample['audio']
-            sample_rate = sample['sample_rate']
-            
-            print(f"GPU {device} (Rank {rank}) - Starting sample #{i+1}, video_id: {video_id}")
-
-            with tempfile.TemporaryDirectory(prefix=f"worker_{device}_") as temp_dir:
-                try:
-                    temp_path = Path(temp_dir)
-                    emilia_output_dir = temp_path / "processed"
-                    
-                    # Save the audio bytes from the sample to a temporary .wav file
-                    input_wav_path = temp_path / f"{video_id}.wav"
-                    sf.write(input_wav_path, audio_bytes, sample_rate, format='WAV', subtype='PCM_16')
-
-                    # --- 2. PROCESS with Emilia-pipe ---
-                    run_emilia_pipe(str(input_wav_path), str(emilia_output_dir), device)
-                    
-                    # --- 3. UPLOAD processed results TO S3 ---
-                    s3_bucket_name = S3_OUTPUT_DIR.split('/')[2]
-                    s3_prefix = f"processed/{video_id}"
-                    upload_directory_to_s3(emilia_output_dir, s3_bucket_name, s3_prefix)
-                    
-                except Exception as e:
-                    print(f"[!!!] CRITICAL FAILURE on GPU {device} for video_id {video_id}: {e}")
-
-def get_available_gpus() -> list:
-    """Detects available NVIDIA GPU indices."""
-    try:
-        output = subprocess.check_output(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"])
-        return [line.strip() for line in output.decode("utf-8").splitlines()]
-    except Exception:
-        print("[!] nvidia-smi not found. Assuming 1 GPU (device 0).")
-        return ["0"]
+        error_output = e.stderr.decode() if e.stderr else "No stderr output"
+        raise RuntimeError(f"ffmpeg failed with exit code {e.returncode}: {error_output}")
 
 def main():
-    """Orchestrates the pool of GPU worker processes."""
-    processes = []
-    available_devices = get_available_gpus()[:EMILIA_WORKERS]
-    world_size = len(available_devices)
-
-    if world_size == 0:
-        print("[!] No GPUs detected. Aborting.")
-        return
-        
-    print(f"🚀 Starting {world_size} worker processes...")
+    """
+    Main orchestration function. It now handles thread failures gracefully
+    and logs problematic URLs.
+    """
+    # 1. Collect all video URLs
+    print("Collecting all video URLs...")
+    all_video_urls = []
+    cookie_path = '/home/ec2-user/cookies.txt'
+    flat_opts = {'extract_flat': True, 'quiet': True, 'ignoreerrors': True, 'cookiefile': cookie_path}
+    with YoutubeDL(flat_opts) as ydl:
+        for channel_url in CHANNEL_URLS:
+            try:
+                info = ydl.extract_info(channel_url, download=False)
+                if info and info.get("entries"):
+                    urls = [f"https://www.youtube.com/watch?v={e['id']}" for e in info['entries'] if e and 'id' in e]
+                    all_video_urls.extend(urls)
+            except Exception as e:
+                 print(f"Could not process channel {channel_url}: {e}")
     
-    for rank, device in enumerate(available_devices):
-        # Each process is given a unique rank (0, 1, 2, ...) and the total number of processes (world_size)
-        p = multiprocessing.Process(target=processing_worker, args=(rank, world_size, device))
-        p.start()
-        processes.append(p)
+    print(f"\nFound a total of {len(all_video_urls)} videos to process.")
+    
+    # FIX: Create a single parent temporary directory for the entire run
+    main_temp_dir = tempfile.mkdtemp(prefix="streaming_parent_")
+    try:
+        with open(FAILED_URLS_LOG, "w") as f_failures:
+            with MDSWriter(out=S3_OUTPUT_DIR, columns=DATASET_COLUMNS) as writer:
+                with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+                    
+                    task_counter = itertools.count(start=1)
+                    future_to_task = {}
+                    for url in all_video_urls:
+                        task_num = next(task_counter)
+                        # Pass the shared temp directory path to each thread
+                        future = executor.submit(download_and_write_to_stream, url, writer, task_num, Path(main_temp_dir))
+                        future_to_task[future] = (url, task_num)
+                    
+                    for future in tqdm.tqdm(as_completed(future_to_task), total=len(all_video_urls), desc="Processing Videos"):
+                        url, task_num = future_to_task[future]
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            print(f'\n[!!!] Task #{task_num} for URL {url} generated an exception: {exc}')
+                            f_failures.write(f'{url}\n')
 
-    for p in processes:
-        p.join()
+                            with cooldown_lock:
+                                if cooldown_event.is_set():
+                                    print(f"\n[!!!] Detected a potential rate limit. Initiating {COOLDOWN_PERIOD_SECONDS}-second cooldown...")
+                                    cooldown_event.clear()
+                                    time.sleep(COOLDOWN_PERIOD_SECONDS)
+                                    print("[OK] Cooldown finished. Resuming downloads.")
+                                    cooldown_event.set()
+    finally:
+        # Clean up the main temporary directory at the very end
+        shutil.rmtree(main_temp_dir, ignore_errors=True)
 
-    print("\n✅ Stage 2 Complete: All videos have been processed and uploaded to S3.")
-    print(f"➡️  Processed results are in bucket: {S3_OUTPUT_DIR}/processed/")
-    print("➡️  Next step: Run 'finalize_dataset.py' to create the Hugging Face dataset.")
+
+    print("\n✅ Processing complete.")
+    print(f"   StreamingDataset created at: {S3_OUTPUT_DIR}")
+    print(f"   A log of any failed URLs has been saved to: {FAILED_URLS_LOG}")
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method("fork", force=True)
     main()
