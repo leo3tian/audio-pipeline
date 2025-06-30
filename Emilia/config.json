@@ -1,6 +1,6 @@
 {
     "language": {
-        "multilingual": true,
+        "multilingual": false,
 	"hotwords": false,
         "supported": [
             "zh",
