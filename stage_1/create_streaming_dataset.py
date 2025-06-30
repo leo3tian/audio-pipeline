@@ -38,7 +38,6 @@ DATASET_COLUMNS = {
 def download_and_write_to_stream(video_url: str, writer: MDSWriter, task_num: int, temp_dir: Path):
     """
     Downloads and converts a single video's audio, writing it to the stream.
-    Now uses a shared temporary directory to avoid race conditions.
     """
     cooldown_event.wait()
     
@@ -118,11 +117,18 @@ def main():
     
     print(f"\nFound a total of {len(all_video_urls)} videos to process.")
     
-    # FIX: Create a single parent temporary directory for the entire run
+    # Create a stable local directory for the MDSWriter cache.
+    mds_cache_dir = "mds_writer_cache"
+    if os.path.exists(mds_cache_dir):
+        shutil.rmtree(mds_cache_dir)
+    os.makedirs(mds_cache_dir)
+    
+    # Create a single parent temporary directory for the entire run
     main_temp_dir = tempfile.mkdtemp(prefix="streaming_parent_")
     try:
         with open(FAILED_URLS_LOG, "w") as f_failures:
-            with MDSWriter(out=S3_OUTPUT_DIR, columns=DATASET_COLUMNS) as writer:
+            # By providing a `local` path, we prevent MDSWriter from using /tmp
+            with MDSWriter(out=S3_OUTPUT_DIR, local=mds_cache_dir, columns=DATASET_COLUMNS) as writer:
                 with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
                     
                     task_counter = itertools.count(start=1)
@@ -138,19 +144,24 @@ def main():
                         try:
                             future.result()
                         except Exception as exc:
+                            # This exception is now more likely to be a genuine download error
+                            # rather than a writer thread crash.
                             print(f'\n[!!!] Task #{task_num} for URL {url} generated an exception: {exc}')
                             f_failures.write(f'{url}\n')
 
+                            # The cooldown logic might still be useful for actual rate-limiting,
+                            # but it's less likely to be triggered by writer failures now.
                             with cooldown_lock:
                                 if cooldown_event.is_set():
-                                    print(f"\n[!!!] Detected a potential rate limit. Initiating {COOLDOWN_PERIOD_SECONDS}-second cooldown...")
+                                    print(f"\n[!!!] An error occurred. Initiating {COOLDOWN_PERIOD_SECONDS}-second cooldown as a precaution...")
                                     cooldown_event.clear()
                                     time.sleep(COOLDOWN_PERIOD_SECONDS)
                                     print("[OK] Cooldown finished. Resuming downloads.")
                                     cooldown_event.set()
     finally:
-        # Clean up the main temporary directory at the very end
+        # Clean up the main temporary directory and the MDS cache at the very end
         shutil.rmtree(main_temp_dir, ignore_errors=True)
+        shutil.rmtree(mds_cache_dir, ignore_errors=True)
 
 
     print("\n✅ Processing complete.")
