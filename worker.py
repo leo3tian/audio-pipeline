@@ -7,14 +7,12 @@ from pathlib import Path
 import boto3
 from streaming import StreamingDataset
 import soundfile as sf
+from itertools import islice # Import islice for manual sharding
 
 # --- Configuration ---
-# This is the S3 path to the raw audio dataset created by Stage 1.
 S3_INPUT_DIR = os.getenv("S3_INPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset")
-# This is the S3 path where the processed results will be saved.
 S3_OUTPUT_DIR = os.getenv("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/processed")
-
-EMILIA_WORKERS = 4 # Number of GPUs to use
+EMILIA_WORKERS = 4
 EMILIA_PIPE_PATH = "Emilia/main.py"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
 
@@ -23,6 +21,9 @@ def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str
     s3_client = boto3.client("s3")
     files_to_upload = list(local_directory.rglob("*"))
     file_count = len(files_to_upload)
+    if file_count == 0:
+        print(f"    No files found in {local_directory} to upload.")
+        return
     
     print(f"    Uploading {file_count} files to s3://{s3_bucket}/{s3_prefix}...")
     
@@ -54,27 +55,33 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
 
 def processing_worker(rank: int, world_size: int, device: str):
     """
-    A worker process that reads a unique shard of the StreamingDataset,
+    A worker process that reads a unique slice of the StreamingDataset,
     processes each sample, and uploads the result to a new S3 prefix.
     """
-    # Each worker initializes the dataset. The library handles sharding based on rank and world_size.
-    # The `local` parameter tells the library where to cache downloaded shards.
+    # Each worker initializes the full dataset. This is a cheap operation
+    # that only reads the remote index file.
     with tempfile.TemporaryDirectory() as local_cache_dir:
-        dataset = StreamingDataset(
+        full_dataset = StreamingDataset(
             remote=S3_INPUT_DIR,
             local=local_cache_dir,
-            shuffle=False, # Important for ensuring each worker gets a unique set
-            num_canonical_nodes=world_size,
-            rank=rank
+            shuffle=False
         )
 
-        # Iterate over the unique shard of the dataset assigned to this worker
-        for i, sample in enumerate(dataset):
+        # FIX: Create a unique slice of the dataset for this worker using islice.
+        # This is more robust than passing rank/world_size to the constructor.
+        # For example, with 4 workers, worker 0 gets samples 0, 4, 8, ...
+        # and worker 1 gets samples 1, 5, 9, ...
+        dataset_slice = islice(full_dataset, rank, None, world_size)
+
+        # Iterate over the unique slice of the dataset assigned to this worker
+        for i, sample in enumerate(dataset_slice):
+            # The global index is rank + i * world_size
+            global_index = rank + (i * world_size)
             video_id = sample['video_id']
             audio_bytes = sample['audio']
             sample_rate = sample['sample_rate']
             
-            print(f"GPU {device} (Rank {rank}) - Starting sample #{i+1}, video_id: {video_id}")
+            print(f"GPU {device} (Rank {rank}) - Starting sample #{global_index}, video_id: {video_id}")
 
             with tempfile.TemporaryDirectory(prefix=f"worker_{device}_") as temp_dir:
                 try:
@@ -89,7 +96,7 @@ def processing_worker(rank: int, world_size: int, device: str):
                     run_emilia_pipe(str(input_wav_path), str(emilia_output_dir), device)
                     
                     # --- 3. UPLOAD processed results TO S3 ---
-                    s3_bucket_name = S3_OUTPUT_DIR.split('/')[2]
+                    s3_bucket_name = S3_OUTPUT_DIR.split('//')[1].split('/')[0]
                     s3_prefix = f"processed/{video_id}"
                     upload_directory_to_s3(emilia_output_dir, s3_bucket_name, s3_prefix)
                     
@@ -118,7 +125,6 @@ def main():
     print(f"🚀 Starting {world_size} worker processes...")
     
     for rank, device in enumerate(available_devices):
-        # Each process is given a unique rank (0, 1, 2, ...) and the total number of processes (world_size)
         p = multiprocessing.Process(target=processing_worker, args=(rank, world_size, device))
         p.start()
         processes.append(p)
@@ -127,7 +133,7 @@ def main():
         p.join()
 
     print("\n✅ Stage 2 Complete: All videos have been processed and uploaded to S3.")
-    print(f"➡️  Processed results are in bucket: {S3_OUTPUT_DIR}/processed/")
+    print(f"➡️  Processed results are in bucket: {S3_OUTPUT_DIR}/")
     print("➡️  Next step: Run 'finalize_dataset.py' to create the Hugging Face dataset.")
 
 if __name__ == "__main__":
