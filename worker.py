@@ -46,7 +46,7 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     python {emilia_script} --input_file_path '{input_wav_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}'
     """
     try:
-        subprocess.run(cmd, shell=True, executable="/bin/bash", check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess.run(cmd, shell=True, executable="/bin/bash", check=True)
         print(f"GPU {device} - ✅ Successfully processed: {input_wav_file}")
     except subprocess.CalledProcessError as e:
         error_message = e.stderr.decode()
