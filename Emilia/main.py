@@ -14,9 +14,9 @@ import warnings
 import logging
 import torch
 from pydub import AudioSegment
-# FIX: Import Annotation from its correct location
+# FIX: Import Annotation and Segment from their correct locations
 from pyannote.audio import Pipeline
-from pyannote.core import Annotation
+from pyannote.core import Annotation, Segment
 import pandas as pd
 
 from utils.tool import (
@@ -168,7 +168,10 @@ def speaker_diarization(audio):
         # The results from the chunk are relative to the chunk's start (0s).
         # We need to shift the timestamps to be relative to the full audio file's start.
         for segment, track, label in chunk_annotation.itertracks(yield_label=True):
-            shifted_segment = segment.shift(start_sample / sample_rate)
+            # FIX: Manually create a new Segment with the shifted start/end times
+            start_time_global = (start_sample / sample_rate) + segment.start
+            end_time_global = (start_sample / sample_rate) + segment.end
+            shifted_segment = Segment(start_time_global, end_time_global)
             full_annotation[shifted_segment] = label
 
     # After processing all chunks, merge overlapping segments from the same speaker
