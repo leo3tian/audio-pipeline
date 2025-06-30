@@ -14,7 +14,8 @@ import warnings
 import torch
 import logging
 from pydub import AudioSegment
-from pyannote.audio import Pipeline, Annotation
+from pyannote.audio import Pipeline
+from pyannote.core import Annotation
 import pandas as pd
 
 from utils.tool import (
