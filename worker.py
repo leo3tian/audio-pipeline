@@ -143,5 +143,5 @@ def main():
     print("➡️  Next step: Run 'finalize_dataset.py' to create the Hugging Face dataset.")
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method("fork", force=True)
+    multiprocessing.set_start_method("spawn", force=True)
     main()
