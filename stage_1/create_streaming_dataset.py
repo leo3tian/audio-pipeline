@@ -14,7 +14,7 @@ import tqdm
 
 # --- Configuration ---
 CHANNEL_URLS = [
-    "https://www.youtube.com/@CodeAesthetic/videos",
+    "https://www.youtube.com/@mostlynitpicking/videos",
 ]
 
 S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset") 
