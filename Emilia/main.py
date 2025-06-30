@@ -11,10 +11,10 @@ import sys
 import os
 import tqdm
 import warnings
-import logging
 import torch
+import logging
 from pydub import AudioSegment
-from pyannote.audio import Pipeline
+from pyannote.audio import Pipeline, Annotation
 import pandas as pd
 
 from utils.tool import (
@@ -36,20 +36,6 @@ audio_count = 0
 def standardization(audio):
     """
     Preprocess the audio file, including setting sample rate, bit depth, channels, and volume normalization.
-
-    Args:
-        audio (str or AudioSegment): Audio file path or AudioSegment object, the audio to be preprocessed.
-
-    Returns:
-        dict: A dictionary containing the preprocessed audio waveform, audio file name, and sample rate, formatted as:
-              {
-                  "waveform": np.ndarray, the preprocessed audio waveform, dtype is np.float32, shape is (num_samples,)
-                  "name": str, the audio file name
-                  "sample_rate": int, the audio sample rate
-              }
-
-    Raises:
-        ValueError: If the audio parameter is neither a str nor an AudioSegment.
     """
     global audio_count
     name = "audio"
@@ -65,24 +51,22 @@ def standardization(audio):
 
     logger.debug("Entering the preprocessing of audio")
 
-    # Convert the audio file to WAV format
     audio = audio.set_frame_rate(cfg["entrypoint"]["SAMPLE_RATE"])
-    audio = audio.set_sample_width(2)  # Set bit depth to 16bit
-    audio = audio.set_channels(1)  # Set to mono
+    audio = audio.set_sample_width(2)
+    audio = audio.set_channels(1)
 
     logger.debug("Audio file converted to WAV format")
 
-    # Calculate the gain to be applied
     target_dBFS = -20
     gain = target_dBFS - audio.dBFS
     logger.info(f"Calculating the gain needed for the audio: {gain} dB")
 
-    # Normalize volume and limit gain range to between -3 and 3
     normalized_audio = audio.apply_gain(min(max(gain, -3), 3))
 
     waveform = np.array(normalized_audio.get_array_of_samples(), dtype=np.float32)
     max_amplitude = np.max(np.abs(waveform))
-    waveform /= max_amplitude  # Normalize
+    if max_amplitude > 0:
+        waveform /= max_amplitude
 
     logger.debug(f"waveform shape: {waveform.shape}")
     logger.debug("waveform in np ndarray, dtype=" + str(waveform.dtype))
@@ -97,32 +81,17 @@ def standardization(audio):
 @time_logger
 def source_separation(predictor, audio):
     """
-    Separate the audio into vocals and non-vocals using the given predictor.
-
-    Args:
-        predictor: The separation model predictor.
-        audio (str or dict): The audio file path or a dictionary containing audio waveform and sample rate.
-
-    Returns:
-        dict: A dictionary containing the separated vocals and updated audio waveform.
+    Separate the audio into vocals and non-vocals.
     """
-
-    mix, rate = None, None
-
-    if isinstance(audio, str):
-        mix, rate = librosa.load(audio, mono=False, sr=44100)
-    else:
-        # resample to 44100
-        rate = audio["sample_rate"]
-        mix = librosa.resample(audio["waveform"], orig_sr=rate, target_sr=44100)
+    rate = audio["sample_rate"]
+    mix = librosa.resample(audio["waveform"], orig_sr=rate, target_sr=44100)
 
     vocals, no_vocals = predictor.predict(mix)
 
-    # convert vocals back to previous sample rate
     logger.debug(f"vocals shape before resample: {vocals.shape}")
     vocals = librosa.resample(vocals.T, orig_sr=44100, target_sr=rate).T
     logger.debug(f"vocals shape after resample: {vocals.shape}")
-    audio["waveform"] = vocals[:, 0]  # vocals is stereo, only use one channel
+    audio["waveform"] = vocals[:, 0]
 
     return audio
 
@@ -132,30 +101,47 @@ def source_separation(predictor, audio):
 def speaker_diarization(audio):
     """
     Perform speaker diarization on the given audio.
-
-    Args:
-        audio (dict): A dictionary containing the audio waveform and sample rate.
-
-    Returns:
-        pd.DataFrame: A dataframe containing segments with speaker labels.
+    FIX: Now processes audio in chunks to prevent CUDA Out of Memory errors.
     """
-    logger.debug(f"Start speaker diarization")
-    logger.debug(f"audio waveform shape: {audio['waveform'].shape}")
+    logger.debug("Start speaker diarization")
+    waveform_full = audio['waveform']
+    sample_rate = audio['sample_rate']
+    
+    chunk_duration_s = 30.0  # Process in 30-second chunks
+    chunk_samples = int(chunk_duration_s * sample_rate)
+    
+    full_annotation = Annotation()
+    
+    print("  Diarizing in chunks to conserve memory...")
+    for start_sample in tqdm.tqdm(range(0, len(waveform_full), chunk_samples), desc="Diarization Chunks"):
+        end_sample = start_sample + chunk_samples
+        chunk_waveform = waveform_full[start_sample:end_sample]
+        
+        # Skip empty chunks
+        if len(chunk_waveform) == 0:
+            continue
 
-    waveform = torch.tensor(audio["waveform"]).to(device)
-    waveform = torch.unsqueeze(waveform, 0)
-
-    segments = dia_pipeline(
-        {
-            "waveform": waveform,
-            "sample_rate": audio["sample_rate"],
-            "channel": 0,
+        # Prepare chunk for the pipeline
+        chunk_for_pipeline = {
+            "waveform": torch.tensor(chunk_waveform).unsqueeze(0).to(device),
+            "sample_rate": sample_rate,
         }
-    )
+        
+        # Get diarization for the current chunk
+        chunk_annotation = dia_pipeline(chunk_for_pipeline)
+
+        # Shift the segment times in the chunk's annotation to be relative to the full audio
+        for segment, track, label in chunk_annotation.itertracks(yield_label=True):
+            start_time_global = start_sample / sample_rate + segment.start
+            end_time_global = start_sample / sample_rate + segment.end
+            full_annotation[segment.shift(start_sample / sample_rate)] = label
+
+    # Merge overlapping segments from different chunks
+    full_annotation = full_annotation.support()
 
     diarize_df = pd.DataFrame(
-        segments.itertracks(yield_label=True),
-        columns=["segment", "label", "speaker"],
+        full_annotation.itertracks(yield_label=True),
+        columns=["segment", "track", "speaker"],
     )
     diarize_df["start"] = diarize_df["segment"].apply(lambda x: x.start)
     diarize_df["end"] = diarize_df["segment"].apply(lambda x: x.end)
@@ -168,17 +154,11 @@ def speaker_diarization(audio):
 @time_logger
 def cut_by_speaker_label(vad_list):
     """
-    Merge and trim VAD segments by speaker labels, enforcing constraints on segment length and merge gaps.
-
-    Args:
-        vad_list (list): List of VAD segments with start, end, and speaker labels.
-
-    Returns:
-        list: A list of updated VAD segments after merging and trimming.
+    Merge and trim VAD segments by speaker labels.
     """
-    MERGE_GAP = 2  # merge gap in seconds, if smaller than this, merge
-    MIN_SEGMENT_LENGTH = 3  # min segment length in seconds
-    MAX_SEGMENT_LENGTH = 30  # max segment length in seconds
+    MERGE_GAP = 2
+    MIN_SEGMENT_LENGTH = 3
+    MAX_SEGMENT_LENGTH = 30
 
     updated_list = []
 
@@ -194,11 +174,11 @@ def cut_by_speaker_label(vad_list):
                 f"cut_by_speaker_label > segment longer than 30s, force trimming to 30s smaller segments"
             )
             while segment_end - current_start >= MAX_SEGMENT_LENGTH:
-                vad["end"] = current_start + MAX_SEGMENT_LENGTH  # update end time
+                vad["end"] = current_start + MAX_SEGMENT_LENGTH
                 updated_list.append(vad)
                 vad = vad.copy()
                 current_start += MAX_SEGMENT_LENGTH
-                vad["start"] = current_start  # update start time
+                vad["start"] = current_start
                 vad["end"] = segment_end
             updated_list.append(vad)
             continue
@@ -217,7 +197,7 @@ def cut_by_speaker_label(vad_list):
         ):
             updated_list.append(vad)
         else:
-            updated_list[-1]["end"] = vad["end"]  # merge the time
+            updated_list[-1]["end"] = vad["end"]
 
     logger.debug(
         f"cut_by_speaker_label > merged {len(vad_list) - len(updated_list)} segments"
@@ -237,14 +217,7 @@ def cut_by_speaker_label(vad_list):
 @time_logger
 def asr(vad_segments, audio):
     """
-    Perform Automatic Speech Recognition (ASR) on the VAD segments of the given audio.
-
-    Args:
-        vad_segments (list): List of VAD segments with start and end times.
-        audio (dict): A dictionary containing the audio waveform and sample rate.
-
-    Returns:
-        list: A list of ASR results with transcriptions and language details.
+    Perform Automatic Speech Recognition (ASR) on the VAD segments.
     """
     if len(vad_segments) == 0:
         return []
@@ -254,14 +227,12 @@ def asr(vad_segments, audio):
     end_time = vad_segments[-1]["end"]
     start_frame = int(start_time * audio["sample_rate"])
     end_frame = int(end_time * audio["sample_rate"])
-    temp_audio = temp_audio[start_frame:end_frame]  # remove silent start and end
+    temp_audio = temp_audio[start_frame:end_frame]
 
-    # update vad_segments start and end time (this is a little trick for batched asr:)
     for idx, segment in enumerate(vad_segments):
         vad_segments[idx]["start"] -= start_time
         vad_segments[idx]["end"] -= start_time
 
-    # resample to 16k
     temp_audio = librosa.resample(
         temp_audio, orig_sr=audio["sample_rate"], target_sr=16000
     )
@@ -269,49 +240,39 @@ def asr(vad_segments, audio):
     if multilingual_flag:
         logger.debug("Multilingual flag is on")
         valid_vad_segments, valid_vad_segments_language = [], []
-        # get valid segments to be transcripted
         for idx, segment in enumerate(vad_segments):
             start_frame = int(segment["start"] * 16000)
             end_frame = int(segment["end"] * 16000)
             segment_audio = temp_audio[start_frame:end_frame]
             language, prob = asr_model.detect_language(segment_audio)
-            # 1. if language is in supported list, 2. if prob > 0.8
             if language in supported_languages and prob > 0.8:
                 valid_vad_segments.append(vad_segments[idx])
                 valid_vad_segments_language.append(language)
 
-        # if no valid segment, return empty
         if len(valid_vad_segments) == 0:
             return []
         all_transcribe_result = []
-        logger.debug(f"valid_vad_segments_language: {valid_vad_segments_language}")
         unique_languages = list(set(valid_vad_segments_language))
-        logger.debug(f"unique_languages: {unique_languages}")
-        # process each language one by one
         for language_token in unique_languages:
             language = language_token
-            # filter out segments with different language
-            vad_segments = [
+            vad_segments_lang = [
                 valid_vad_segments[i]
                 for i, x in enumerate(valid_vad_segments_language)
                 if x == language
             ]
-            # bacthed trascription
             transcribe_result_temp = asr_model.transcribe(
                 temp_audio,
-                vad_segments,
+                vad_segments_lang,
                 batch_size=batch_size,
                 language=language,
-                print_progress=True,
+                print_progress=False,
             )
             result = transcribe_result_temp["segments"]
-            # restore the segment annotation
             for idx, segment in enumerate(result):
                 result[idx]["start"] += start_time
                 result[idx]["end"] += start_time
                 result[idx]["language"] = transcribe_result_temp["language"]
             all_transcribe_result.extend(result)
-        # sort by start time
         all_transcribe_result = sorted(all_transcribe_result, key=lambda x: x["start"])
         return all_transcribe_result
     else:
@@ -323,7 +284,7 @@ def asr(vad_segments, audio):
                 vad_segments,
                 batch_size=batch_size,
                 language=language,
-                print_progress=True,
+                print_progress=False,
             )
             result = transcribe_result["segments"]
             for idx, segment in enumerate(result):
@@ -338,89 +299,63 @@ def asr(vad_segments, audio):
 @time_logger
 def mos_prediction(audio, vad_list):
     """
-    Predict the Mean Opinion Score (MOS) for the given audio and VAD segments.
-
-    Args:
-        audio (dict): A dictionary containing the audio waveform and sample rate.
-        vad_list (list): List of VAD segments with start and end times.
-
-    Returns:
-        tuple: A tuple containing the average MOS and the updated VAD segments with MOS scores.
+    Predict the Mean Opinion Score (MOS) for the given audio segments.
     """
-    audio = audio["waveform"]
+    audio_waveform = audio["waveform"]
     sample_rate = 16000
 
-    audio = librosa.resample(
-        audio, orig_sr=cfg["entrypoint"]["SAMPLE_RATE"], target_sr=sample_rate
+    audio_resampled = librosa.resample(
+        audio_waveform, orig_sr=cfg["entrypoint"]["SAMPLE_RATE"], target_sr=sample_rate
     )
 
     for index, vad in enumerate(tqdm.tqdm(vad_list, desc="DNSMOS")):
         start, end = int(vad["start"] * sample_rate), int(vad["end"] * sample_rate)
-        segment = audio[start:end]
-
-        dnsmos = dnsmos_compute_score(segment, sample_rate, False)["SIG"]
-
-        vad_list[index]["dnsmos"] = dnsmos
+        segment = audio_resampled[start:end]
+        dnsmos_score = dnsmos_compute_score(segment, sample_rate, False)["SIG"]
+        vad_list[index]["dnsmos"] = dnsmos_score
 
     predict_dnsmos = np.mean([vad["dnsmos"] for vad in vad_list])
-
     logger.debug(f"avg predict_dnsmos for whole audio: {predict_dnsmos}")
-
     return predict_dnsmos, vad_list
 
 
-def filter(mos_list):
+def filter_segments(mos_list):
     """
-    Filter out the segments with MOS scores, wrong char duration, and total duration.
-
-    Args:
-        mos_list (list): List of VAD segments with MOS scores.
-
-    Returns:
-        list: A list of VAD segments with MOS scores above the average MOS.
+    Filter out segments based on quality metrics.
     """
     filtered_audio_stats, all_audio_stats = calculate_audio_stats(mos_list)
-    filtered_segment = len(filtered_audio_stats)
-    all_segment = len(all_audio_stats)
-    logger.debug(
-        f"> {all_segment - filtered_segment}/{all_segment} {(all_segment - filtered_segment) / all_segment:.2%} segments filtered."
-    )
+    filtered_segment_count = len(filtered_audio_stats)
+    all_segment_count = len(all_audio_stats)
+    
+    if all_segment_count > 0:
+        logger.debug(
+            f"> {all_segment_count - filtered_segment_count}/{all_segment_count} "
+            f"({(all_segment_count - filtered_segment_count) / all_segment_count:.2%}) segments filtered."
+        )
+    
     filtered_list = [mos_list[idx] for idx, _ in filtered_audio_stats]
-    # changed to return list of all segments
     all_list = [mos_list[idx] for idx, _ in all_audio_stats]
     return filtered_list, all_list
 
 
 def main_process(audio_path, save_path=None, audio_name=None):
     """
-    Process the audio file, including standardization, source separation, speaker segmentation, VAD, ASR, export to MP3, and MOS prediction.
-
-    Args:
-        audio_path (str): Audio file path.
-        save_path (str, optional): Save path, defaults to None, which means saving in the "_processed" folder in the audio file's directory.
-        audio_name (str, optional): Audio file name, defaults to None, which means using the file name from the audio file path.
-
-    Returns:
-        tuple: Contains the save path and the MOS list.
+    Main processing function for a single audio file.
     """
-    if not audio_path.endswith((".mp3", ".wav", ".flac", ".m4a", ".aac")):
+    if not any(audio_path.endswith(ext) for ext in (".mp3", ".wav", ".flac", ".m4a", ".aac")):
         logger.warning(f"Unsupported file type: {audio_path}")
+        return None, None
 
-    # for a single audio from path Ïaaa/bbb/ccc.wav ---> save to aaa/bbb_processed/ccc/ccc_0.wav
     audio_name = audio_name or os.path.splitext(os.path.basename(audio_path))[0]
+    
     if save_path is None:
-        save_path = os.path.join(os.path.dirname(audio_path) + "_processed", audio_name)
-    else:
-        # If an explicit save_path is given, use it directly.
-        pass
+        processed_folder = os.path.dirname(audio_path) + "_processed"
+        save_path = os.path.join(processed_folder, audio_name)
+    
     os.makedirs(save_path, exist_ok=True)
-    logger.debug(
-        f"Processing audio: {audio_name}, from {audio_path}, save to: {save_path}"
-    )
+    logger.debug(f"Processing audio: {audio_name}, from {audio_path}, save to: {save_path}")
 
-    logger.info(
-        "Step 0: Preprocess all audio files --> 24k sample rate + wave format + loudnorm + bit depth 16"
-    )
+    logger.info("Step 0: Preprocessing")
     audio = standardization(audio_path)
 
     logger.info("Step 1: Source Separation")
@@ -429,9 +364,9 @@ def main_process(audio_path, save_path=None, audio_name=None):
     logger.info("Step 2: Speaker Diarization")
     speakerdia = speaker_diarization(audio)
 
-    logger.info("Step 3: Fine-grained Segmentation by VAD")
+    logger.info("Step 3: VAD Segmentation")
     vad_list = vad.vad(speakerdia, audio)
-    segment_list = cut_by_speaker_label(vad_list)  # post process after vad
+    segment_list = cut_by_speaker_label(vad_list)
 
     logger.info("Step 4: ASR")
     asr_result = asr(segment_list, audio)
@@ -439,28 +374,20 @@ def main_process(audio_path, save_path=None, audio_name=None):
         logger.warning(f"No valid ASR result for {audio_name}, skipping.")
         return None, None
 
-
-    logger.info("Step 5: Filter")
-    logger.info("Step 5.1: calculate mos_prediction")
+    logger.info("Step 5: MOS Prediction & Filtering")
     avg_mos, mos_list = mos_prediction(audio, asr_result)
+    logger.info(f"  Average MOS: {avg_mos}")
+    filtered_list, all_list = filter_segments(mos_list)
 
-    logger.info(f"Step 5.1: done, average MOS: {avg_mos}")
+    with open(os.path.join(save_path, "filtered_segments.json"), "w", encoding='utf8') as f:
+        json.dump(filtered_list, f, indent=2, ensure_ascii=False)
 
-    logger.info("MODIFIED Step 5.2: Filter out files with less than average MOS")
-    filtered_list, all_list = filter(mos_list)
-
-    # dump filtered
-    with open(os.path.join(save_path, "filtered_segments.json"), "w") as f:
-        json.dump(filtered_list, f, indent=2)
-
-    # dump all (your original code saved the filtered list as all_segments.json, I'm keeping that logic)
     final_path = os.path.join(save_path, "all_segments.json")
-    with open(final_path, "w") as f:
+    with open(final_path, "w", encoding='utf8') as f:
         json.dump(all_list, f, indent=2, ensure_ascii=False)
 
-    logger.info("Step 6: write result into MP3 and JSON file")
+    logger.info("Step 6: Exporting to MP3")
     export_to_mp3(audio, all_list, save_path, audio_name)
-
 
     logger.info(f"All done, Saved to: {final_path}")
     return final_path, all_list
@@ -468,78 +395,21 @@ def main_process(audio_path, save_path=None, audio_name=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--input_folder_path",
-        type=str,
-        default=None,
-        help="Input folder path with audio files. Overrides config if set.",
-    )
-    # DEBUGGING FIX: Add new argument for single file processing
-    parser.add_argument(
-        "--input_file_path",
-        type=str,
-        default=None,
-        help="Path to a single audio file to process. Takes precedence over input_folder_path.",
-    )
-    parser.add_argument(
-        "--config_path", type=str, default="config.json", help="config path"
-    )
-    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
-    parser.add_argument(
-        "--compute_type",
-        type=str,
-        default="float16",
-        help="The compute type to use for the model",
-    )
-    parser.add_argument(
-        "--whisper_arch",
-        type=str,
-        default="medium",
-        help="The name of the Whisper model to load.",
-    )
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=4,
-        help="The number of CPU threads to use per worker, e.g. will be multiplied by num workers.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Optional base directory to store all processed outputs"
-    )
-    # DEBUGGING FIX: Add a quiet flag to suppress logs when called from worker
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress detailed logging, useful when called from a worker script."
-    )
-    parser.add_argument(
-        "--exit_pipeline",
-        type=bool,
-        default=False,
-        help="Exit pipeline when task done.",
-    )
+    parser.add_argument("--input_file_path", type=str, required=True, help="Path to a single audio file to process.")
+    parser.add_argument("--config_path", type=str, default="Emilia/config.json", help="Config path")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to store all processed outputs")
+    parser.add_argument("--batch_size", type=int, default=16, help="ASR batch size")
+    parser.add_argument("--compute_type", type=str, default="float16", help="Compute type for Whisper model")
+    parser.add_argument("--whisper_arch", type=str, default="medium", help="Whisper model size")
+    parser.add_argument("--threads", type=int, default=4, help="CPU threads for ASR")
+    
     args = parser.parse_args()
 
     batch_size = args.batch_size
     cfg = load_cfg(args.config_path)
-    cfg["huggingface_token"] = os.getenv("HF_TOKEN")
 
-    # Set up logger
     logger = Logger.get_logger()
-    if args.quiet:
-        logger.setLevel(logging.WARNING)
 
-
-    if args.input_folder_path and not args.input_file_path:
-        logger.info(f"Using input folder path from arguments: {args.input_folder_path}")
-        cfg["entrypoint"]["input_folder_path"] = args.input_folder_path
-
-    logger.debug("Loading models...")
-
-    # Load models
     if detect_gpu():
         logger.info("Using GPU")
         device_name = "cuda"
@@ -548,82 +418,27 @@ if __name__ == "__main__":
         logger.info("Using CPU")
         device_name = "cpu"
         device = torch.device(device_name)
-        # whisperX expects compute type: int8
-        logger.info("Overriding the compute type to int8")
         args.compute_type = "int8"
 
-    check_env(logger)
-
-    # Speaker Diarization
-    logger.debug(" * Loading Speaker Diarization Model")
+    hf_token = os.getenv("HF_TOKEN")
+    if cfg.get("huggingface_token") == "READ_FROM_ENVIRONMENT_VARIABLE" and hf_token:
+        cfg["huggingface_token"] = hf_token
+    
     if not cfg["huggingface_token"].startswith("hf"):
-        raise ValueError(
-            "huggingface_token must start with 'hf', check the config file. "
-            "You can get the token at https://huggingface.co/settings/tokens. "
-            "Remeber grant access following https://github.com/pyannote/pyannote-audio?tab=readme-ov-file#tldr"
-        )
-    dia_pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=cfg["huggingface_token"],
-    )
+        raise ValueError("Hugging Face token is missing or invalid.")
+
+    # Load Models
+    logger.info("Loading models...")
+    dia_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=cfg["huggingface_token"])
     dia_pipeline.to(device)
-
-    # ASR
-    logger.debug(" * Loading ASR Model")
-    asr_model = whisper_asr.load_asr_model(
-        args.whisper_arch,
-        device_name,
-        compute_type=args.compute_type,
-        threads=args.threads,
-        asr_options={
-            "initial_prompt": "Um, Uh, Ah. Like, you know. I mean, right. Actually. Basically, and right? okay. Alright. Emm. So. Oh. 生于忧患,死于安乐。岂不快哉?当然,嗯,呃,就,这样,那个,哪个,啊,呀,哎呀,哎哟,唉哇,啧,唷,哟,噫!微斯人,吾谁与归?ええと、あの、ま、そう、ええ。äh, hm, so, tja, halt, eigentlich. euh, quoi, bah, ben, tu vois, tu sais, t'sais, eh bien, du coup. genre, comme, style. 응,어,그,음."
-        },
-    )
-
-    # VAD
-    logger.debug(" * Loading VAD Model")
+    
+    asr_model = whisper_asr.load_asr_model(args.whisper_arch, device_name, compute_type=args.compute_type, threads=args.threads)
     vad = silero_vad.SileroVAD(device=device)
-
-    # Background Noise Separation
-    logger.debug(" * Loading Background Noise Model")
-    separate_predictor1 = separate_fast.Predictor(
-        args=cfg["separate"]["step1"], device=device_name
-    )
-
-    # DNSMOS Scoring
-    logger.debug(" * Loading DNSMOS Model")
-    primary_model_path = cfg["mos_model"]["primary_model_path"]
-    dnsmos_compute_score = dnsmos.ComputeScore(primary_model_path, device_name)
-    logger.debug("All models loaded")
+    separate_predictor1 = separate_fast.Predictor(args=cfg["separate"]["step1"], device=device_name)
+    dnsmos_compute_score = dnsmos.ComputeScore(cfg["mos_model"]["primary_model_path"], device_name)
+    logger.info("All models loaded.")
 
     supported_languages = cfg["language"]["supported"]
     multilingual_flag = cfg["language"]["multilingual"]
-    logger.debug(f"supported languages multilingual {supported_languages}")
-    logger.debug(f"using multilingual asr {multilingual_flag}")
 
-    # --- DEBUGGING FIX: Main processing logic ---
-    # Prioritize processing a single file if the argument is provided.
-    if args.input_file_path:
-        if not os.path.exists(args.input_file_path):
-             raise FileNotFoundError(f"Input file not found: {args.input_file_path}")
-        logger.info(f"Processing single file: {args.input_file_path}")
-        # The output_dir from args will be the base for this specific file's output
-        main_process(args.input_file_path, save_path=args.output_dir)
-
-    # Fallback to folder processing if no single file is specified.
-    elif args.input_folder_path:
-        input_folder_path = args.input_folder_path
-        if not os.path.exists(input_folder_path):
-            raise FileNotFoundError(f"input_folder_path: {input_folder_path} not found")
-
-        audio_paths = get_audio_files(input_folder_path)  # Get all audio files
-        logger.info(f"Scanning {len(audio_paths)} audio files in {input_folder_path}")
-
-        for path in audio_paths:
-             # For folder mode, create a sub-directory for each audio file within the main output_dir
-            audio_name = os.path.splitext(os.path.basename(path))[0]
-            specific_save_path = os.path.join(args.output_dir, audio_name) if args.output_dir else None
-            main_process(path, save_path=specific_save_path)
-    else:
-        logger.error("No input specified. Please provide --input_file_path or --input_folder_path.")
-
+    main_process(args.input_file_path, save_path=args.output_dir)
