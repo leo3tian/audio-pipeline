@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import random
 import threading
+import itertools
+import shutil
 
 # --- Configuration ---
 CHANNEL_URLS = [
@@ -20,13 +22,10 @@ NUM_WORKERS = 4
 FAILED_URLS_LOG = "failed_urls.log"
 COOLDOWN_PERIOD_SECONDS = 60
 
-# --- NEW: Synchronization objects for rate-limiting cooldown ---
-# This acts as a "traffic light". Threads will wait if it's cleared (red light).
+# --- Synchronization objects for rate-limiting cooldown ---
 cooldown_event = threading.Event()
-cooldown_event.set()  # Start with the light green (set)
-# This lock ensures only one thread can trigger the cooldown at a time.
+cooldown_event.set()
 cooldown_lock = threading.Lock()
-
 
 # Define the columns (schema) for the raw audio dataset
 DATASET_COLUMNS = {
@@ -35,26 +34,25 @@ DATASET_COLUMNS = {
     'sample_rate': 'int'
 }
 
-def download_and_write_to_stream(video_url: str, writer: MDSWriter):
+def download_and_write_to_stream(video_url: str, writer: MDSWriter, task_num: int, temp_dir: Path):
     """
     Downloads and converts a single video's audio, writing it to the stream.
-    This function will now pause if a global cooldown is active.
+    Now uses a shared temporary directory to avoid race conditions.
     """
-    # NEW: Before starting, check the traffic light. This will block if a cooldown is active.
     cooldown_event.wait()
+    
+    # Use a unique subdirectory within the shared temp_dir for this specific task
+    task_temp_path = temp_dir / f"task_{task_num}"
+    os.makedirs(task_temp_path, exist_ok=True)
 
-    # Create a unique temporary directory for this download
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        
+    try:
         ydl_opts = {
             'format': 'bestaudio/best', 'quiet': True, 'ignoreerrors': True,
             'cookiefile': '/home/ec2-user/cookies.txt',
-            'outtmpl': str(temp_path / '%(id)s.%(ext)s'),
+            'outtmpl': str(task_temp_path / '%(id)s.%(ext)s'),
         }
 
-        # Step 1: Download the full audio file to the local disk
-        # print(f"Downloading: {video_url}") # Reducing log spam
+        # Step 1: Download the full audio file
         with YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(video_url, download=True)
             if not info_dict:
@@ -66,21 +64,23 @@ def download_and_write_to_stream(video_url: str, writer: MDSWriter):
             if not os.path.exists(downloaded_filepath):
                  raise FileNotFoundError(f"Could not find downloaded file at {downloaded_filepath}")
 
-        # Step 2: Use ffmpeg to convert the local file
-        # print(f"  Converting: {video_id}")
+        # Step 2: Convert the local file using ffmpeg
         output_wav_bytes = convert_audio_to_wav(downloaded_filepath)
 
-        # Step 3: Write the audio bytes to the streaming dataset
+        # Step 3: Write to the streaming dataset
         sample = {
             'video_id': video_id,
             'audio': output_wav_bytes,
             'sample_rate': SAMPLE_RATE
         }
         writer.write(sample)
-        # print(f"  ✅ Wrote {video_id} to stream.")
+        print(f"  ✅ [Video #{task_num}] Wrote {video_id} to stream.")
 
-        # Add a small random delay to mimic human behavior
         time.sleep(random.uniform(1, 3))
+    finally:
+        # Clean up the specific task's subdirectory
+        shutil.rmtree(task_temp_path, ignore_errors=True)
+
 
 def convert_audio_to_wav(local_filepath: str) -> bytes:
     """Converts a local audio file to WAV format in memory using ffmpeg."""
@@ -89,7 +89,7 @@ def convert_audio_to_wav(local_filepath: str) -> bytes:
         '-ar', str(SAMPLE_RATE), '-ac', '1', '-'
     ]
     try:
-        process = subprocess.run(ffmpeg_command, capture_output=True, check=True, timeout=300) # Added timeout
+        process = subprocess.run(ffmpeg_command, capture_output=True, check=True, timeout=300)
         return process.stdout
     except subprocess.CalledProcessError as e:
         error_output = e.stderr.decode() if e.stderr else "No stderr output"
@@ -117,31 +117,40 @@ def main():
     
     print(f"\nFound a total of {len(all_video_urls)} videos to process.")
     
-    # Open a log file to record failures
-    with open(FAILED_URLS_LOG, "w") as f_failures:
-        # 2. Use MDSWriter to create the dataset on S3
-        with MDSWriter(out=S3_OUTPUT_DIR, columns=DATASET_COLUMNS) as writer:
-            with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-                
-                future_to_url = {executor.submit(download_and_write_to_stream, url, writer): url for url in all_video_urls}
-                
-                for future in tqdm.tqdm(as_completed(future_to_url), total=len(all_video_urls), desc="Processing Videos"):
-                    url = future_to_url[future]
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        print(f'\n[!!!] A thread for URL {url} generated an exception: {exc}')
-                        f_failures.write(f'{url}\n')
+    # FIX: Create a single parent temporary directory for the entire run
+    main_temp_dir = tempfile.mkdtemp(prefix="streaming_parent_")
+    try:
+        with open(FAILED_URLS_LOG, "w") as f_failures:
+            with MDSWriter(out=S3_OUTPUT_DIR, columns=DATASET_COLUMNS) as writer:
+                with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+                    
+                    task_counter = itertools.count(start=1)
+                    future_to_task = {}
+                    for url in all_video_urls:
+                        task_num = next(task_counter)
+                        # Pass the shared temp directory path to each thread
+                        future = executor.submit(download_and_write_to_stream, url, writer, task_num, Path(main_temp_dir))
+                        future_to_task[future] = (url, task_num)
+                    
+                    for future in tqdm.tqdm(as_completed(future_to_task), total=len(all_video_urls), desc="Processing Videos"):
+                        url, task_num = future_to_task[future]
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            print(f'\n[!!!] Task #{task_num} for URL {url} generated an exception: {exc}')
+                            f_failures.write(f'{url}\n')
 
-                        # --- NEW: Cooldown logic ---
-                        with cooldown_lock:
-                            # Check if a cooldown is already active
-                            if cooldown_event.is_set():
-                                print(f"\n[!!!] Detected a potential rate limit. Initiating {COOLDOWN_PERIOD_SECONDS}-second cooldown...")
-                                cooldown_event.clear() # Red light!
-                                time.sleep(COOLDOWN_PERIOD_SECONDS)
-                                print("[OK] Cooldown finished. Resuming downloads.")
-                                cooldown_event.set() # Green light!
+                            with cooldown_lock:
+                                if cooldown_event.is_set():
+                                    print(f"\n[!!!] Detected a potential rate limit. Initiating {COOLDOWN_PERIOD_SECONDS}-second cooldown...")
+                                    cooldown_event.clear()
+                                    time.sleep(COOLDOWN_PERIOD_SECONDS)
+                                    print("[OK] Cooldown finished. Resuming downloads.")
+                                    cooldown_event.set()
+    finally:
+        # Clean up the main temporary directory at the very end
+        shutil.rmtree(main_temp_dir, ignore_errors=True)
+
 
     print("\n✅ Processing complete.")
     print(f"   StreamingDataset created at: {S3_OUTPUT_DIR}")
