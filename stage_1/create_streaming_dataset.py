@@ -10,10 +10,11 @@ import random
 import threading
 import itertools
 import shutil
+import tqdm
 
 # --- Configuration ---
 CHANNEL_URLS = [
-    "https://www.youtube.com/@tkppodcast/videos",
+    "https://www.youtube.com/@CodeAesthetic/videos",
 ]
 
 S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset") 
