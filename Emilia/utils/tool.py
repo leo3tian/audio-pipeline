@@ -205,7 +205,7 @@ def export_to_mp3(audio, asr_result, folder_path, file_name):
         start, end = int(segment["start"] * sr), int(segment["end"] * sr)
         split_audio = audio[start:end]
         split_audio = librosa.to_mono(split_audio)
-        out_file = f"{file_name}_{idx}.mp3"
+        out_file = f"{file_name}_{idx:06d}.mp3"
         out_path = os.path.join(folder_path, out_file)
         write_mp3(out_path, sr, split_audio)
 
