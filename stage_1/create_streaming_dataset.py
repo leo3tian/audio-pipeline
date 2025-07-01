@@ -11,6 +11,7 @@ import threading
 import itertools
 import shutil
 import tqdm
+import queue
 
 # --- Configuration ---
 CHANNEL_URLS = [
@@ -21,27 +22,16 @@ S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/streami
 SAMPLE_RATE = 24000
 NUM_WORKERS = 4
 FAILED_URLS_LOG = "failed_urls.log"
-COOLDOWN_PERIOD_SECONDS = 60
 
-# --- Synchronization objects for rate-limiting cooldown ---
-cooldown_event = threading.Event()
-cooldown_event.set()
-cooldown_lock = threading.Lock()
+# --- Producer-Consumer Queue ---
+# This queue will safely pass data from the many downloader threads to the single writer thread.
+data_queue = queue.Queue(maxsize=NUM_WORKERS * 2)
 
-# Define the columns (schema) for the raw audio dataset
-DATASET_COLUMNS = {
-    'video_id': 'str',
-    'audio': 'bytes',
-    'sample_rate': 'int'
-}
-
-def download_and_write_to_stream(video_url: str, writer: MDSWriter, task_num: int, temp_dir: Path):
+def producer_thread(video_url: str, task_num: int, temp_dir: Path):
     """
-    Downloads and converts a single video's audio, writing it to the stream.
+    Producer: Downloads a video, processes it, and puts the result into the data_queue.
+    This function no longer interacts with the MDSWriter.
     """
-    cooldown_event.wait()
-    
-    # Use a unique subdirectory within the shared temp_dir for this specific task
     task_temp_path = temp_dir / f"task_{task_num}"
     os.makedirs(task_temp_path, exist_ok=True)
 
@@ -52,11 +42,10 @@ def download_and_write_to_stream(video_url: str, writer: MDSWriter, task_num: in
             'outtmpl': str(task_temp_path / '%(id)s.%(ext)s'),
         }
 
-        # Step 1: Download the full audio file
         with YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(video_url, download=True)
             if not info_dict:
-                raise ValueError("yt-dlp returned no info, likely due to a download error.")
+                raise ValueError("yt-dlp returned no info")
             
             video_id = info_dict.get('id', 'unknown')
             downloaded_filepath = ydl.prepare_filename(info_dict)
@@ -64,23 +53,43 @@ def download_and_write_to_stream(video_url: str, writer: MDSWriter, task_num: in
             if not os.path.exists(downloaded_filepath):
                  raise FileNotFoundError(f"Could not find downloaded file at {downloaded_filepath}")
 
-        # Step 2: Convert the local file using ffmpeg
         output_wav_bytes = convert_audio_to_wav(downloaded_filepath)
 
-        # Step 3: Write to the streaming dataset
         sample = {
             'video_id': video_id,
             'audio': output_wav_bytes,
             'sample_rate': SAMPLE_RATE
         }
-        writer.write(sample)
-        print(f"  ✅ [Video #{task_num}] Wrote {video_id} to stream.")
-
-        time.sleep(random.uniform(1, 3))
+        # Put the completed sample into the queue for the writer thread to process.
+        data_queue.put(sample)
+        return None  # Return None on success
+    except Exception as e:
+        # Return the exception to be handled by the main thread
+        return e
     finally:
-        # Clean up the specific task's subdirectory
         shutil.rmtree(task_temp_path, ignore_errors=True)
 
+def consumer_thread(writer: MDSWriter, total_videos: int):
+    """
+    Consumer: Pulls samples from the data_queue and writes them using the MDSWriter.
+    This is the ONLY thread that touches the writer.
+    """
+    with tqdm.tqdm(total=total_videos, desc="Writing to MDS") as pbar:
+        while True:
+            sample = data_queue.get()
+            # A None in the queue is the signal that all producers are finished.
+            if sample is None:
+                data_queue.task_done()
+                break
+            
+            try:
+                writer.write(sample)
+                pbar.update(1)
+                print(f"  ✅ Wrote {sample['video_id']} to stream.")
+            except Exception as e:
+                print(f"\n[!!!] MDSWriter failed to write sample {sample.get('video_id', 'N/A')}: {e}")
+            
+            data_queue.task_done()
 
 def convert_audio_to_wav(local_filepath: str) -> bytes:
     """Converts a local audio file to WAV format in memory using ffmpeg."""
@@ -97,8 +106,7 @@ def convert_audio_to_wav(local_filepath: str) -> bytes:
 
 def main():
     """
-    Main orchestration function. It now handles thread failures gracefully
-    and logs problematic URLs.
+    Main orchestration function using a producer-consumer pattern.
     """
     # 1. Collect all video URLs
     print("Collecting all video URLs...")
@@ -115,55 +123,53 @@ def main():
             except Exception as e:
                  print(f"Could not process channel {channel_url}: {e}")
     
-    print(f"\nFound a total of {len(all_video_urls)} videos to process.")
+    total_videos = len(all_video_urls)
+    print(f"\nFound a total of {total_videos} videos to process.")
     
-    # Create a stable local directory for all temporary files.
-    mds_cache_dir = os.path.abspath("mds_writer_cache")
-    if os.path.exists(mds_cache_dir):
-        shutil.rmtree(mds_cache_dir)
-    os.makedirs(mds_cache_dir)
-    
-    # *** FIX: Set the TMPDIR environment variable ***
-    # This forces all underlying tempfile operations (used by MDSWriter)
-    # to use our stable directory instead of the system's /tmp.
-    os.environ['TMPDIR'] = mds_cache_dir
-    
-    # Create a separate parent temporary directory for yt-dlp downloads
-    main_temp_dir = tempfile.mkdtemp(prefix="streaming_parent_")
+    # Use a stable directory for all temporary file operations
+    main_temp_dir = os.path.abspath("pipeline_temp_dir")
+    if os.path.exists(main_temp_dir):
+        shutil.rmtree(main_temp_dir)
+    os.makedirs(main_temp_dir)
+    tempfile.tempdir = main_temp_dir
+
     try:
         with open(FAILED_URLS_LOG, "w") as f_failures:
-            # *** FIX: Removed the unsupported `local` argument ***
+            DATASET_COLUMNS = {'video_id': 'str', 'audio': 'bytes', 'sample_rate': 'int'}
             with MDSWriter(out=S3_OUTPUT_DIR, columns=DATASET_COLUMNS) as writer:
+                
+                # Start the single consumer thread
+                writer_thread = threading.Thread(target=consumer_thread, args=(writer, total_videos))
+                writer_thread.start()
+
+                # Start the producer threads
                 with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-                    
                     task_counter = itertools.count(start=1)
-                    future_to_task = {}
-                    for url in all_video_urls:
-                        task_num = next(task_counter)
-                        # Pass the shared temp directory path to each thread
-                        future = executor.submit(download_and_write_to_stream, url, writer, task_num, Path(main_temp_dir))
-                        future_to_task[future] = (url, task_num)
-                    
-                    for future in tqdm.tqdm(as_completed(future_to_task), total=len(all_video_urls), desc="Processing Videos"):
-                        url, task_num = future_to_task[future]
+                    future_to_url = {
+                        executor.submit(producer_thread, url, next(task_counter), Path(main_temp_dir)): url
+                        for url in all_video_urls
+                    }
+
+                    for future in tqdm.tqdm(as_completed(future_to_url), total=total_videos, desc="Downloading Videos"):
+                        url = future_to_url[future]
                         try:
-                            future.result()
+                            # Check for exceptions returned by the producer
+                            result = future.result()
+                            if isinstance(result, Exception):
+                                print(f'\n[!!!] Download failed for URL {url}: {result}')
+                                f_failures.write(f'{url}\n')
                         except Exception as exc:
-                            print(f'\n[!!!] Task #{task_num} for URL {url} generated an exception: {exc}')
+                            print(f'\n[!!!] Critical error in producer thread for URL {url}: {exc}')
                             f_failures.write(f'{url}\n')
 
-                            with cooldown_lock:
-                                if cooldown_event.is_set():
-                                    print(f"\n[!!!] An error occurred. Initiating {COOLDOWN_PERIOD_SECONDS}-second cooldown as a precaution...")
-                                    cooldown_event.clear()
-                                    time.sleep(COOLDOWN_PERIOD_SECONDS)
-                                    print("[OK] Cooldown finished. Resuming downloads.")
-                                    cooldown_event.set()
-    finally:
-        # Clean up the main temporary directory and the MDS cache at the very end
-        shutil.rmtree(main_temp_dir, ignore_errors=True)
-        shutil.rmtree(mds_cache_dir, ignore_errors=True)
+                # All producers are done, signal the consumer to finish
+                data_queue.put(None)
+                
+                # Wait for the consumer thread to finish writing all queued items
+                writer_thread.join()
 
+    finally:
+        shutil.rmtree(main_temp_dir, ignore_errors=True)
 
     print("\n✅ Processing complete.")
     print(f"   StreamingDataset created at: {S3_OUTPUT_DIR}")
