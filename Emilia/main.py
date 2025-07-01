@@ -372,7 +372,7 @@ def mos_prediction(audio, vad_list):
         start, end = int(vad["start"] * sample_rate), int(vad["end"] * sample_rate)
         segment = audio[start:end]
 
-        dnsmos = dnsmos_compute_score(segment, sample_rate, False)["SIG"]
+        dnsmos = dnsmos_compute_score(segment, sample_rate, False)["MOS"]
 
         vad_list[index]["dnsmos"] = dnsmos
 
@@ -464,12 +464,12 @@ def main_process(audio_path, save_path=None, audio_name=None):
     filtered_list, all_list = filter(mos_list)
 
     # dump filtered
-    with open(os.path.join(save_path, "filtered_segments.json"), "w") as f:
-        json.dump(filtered_list, f, indent=2)
+    with open(os.path.join(save_path, "filtered_segments.json"), "w", encoding="utf-8") as f:
+        json.dump(filtered_list, f, indent=2, ensure_ascii=False)
 
     # dump all (your original code saved the filtered list as all_segments.json, I'm keeping that logic)
     final_path = os.path.join(save_path, "all_segments.json")
-    with open(final_path, "w") as f:
+    with open(final_path, "w", encoding="utf-8") as f:
         json.dump(all_list, f, indent=2, ensure_ascii=False)
 
     logger.info("Step 6: write result into MP3 and JSON file")
