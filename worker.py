@@ -55,7 +55,7 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     """
 
     process = subprocess.Popen(cmd, shell=True, executable="/bin/bash", 
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                               stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, 
                                text=True, bufsize=1)
 
     if process.stdout:
