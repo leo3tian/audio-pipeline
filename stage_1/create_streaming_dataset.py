@@ -20,7 +20,7 @@ CHANNEL_URLS = [
 
 S3_OUTPUT_DIR = os.environ.get("S3_OUTPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset") 
 SAMPLE_RATE = 24000
-NUM_WORKERS = 4
+NUM_WORKERS = 8
 FAILED_URLS_LOG = "failed_urls.log"
 
 # --- Producer-Consumer Queue ---
