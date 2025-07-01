@@ -93,43 +93,47 @@ def standardization(audio):
         "sample_rate": cfg["entrypoint"]["SAMPLE_RATE"],
     }
 
-
+# Step 2 source separation
 @time_logger
 def source_separation(predictor, audio):
     """
     Separate the audio into vocals and non-vocals using the given predictor.
-    This version processes the audio in chunks to avoid memory errors with large files.
+    This version processes the audio in chunks to avoid memory errors and improve speed
+    by moving the expensive resampling operations inside the loop.
     """
-    # Define chunk size in seconds. 10 minutes = 600 seconds.
-    CHUNK_DURATION_SECONDS = 600
+    # Define chunk size in seconds. 60 minutes = 3600 seconds.
+    # This value can be increased for a potential performance boost on machines with high RAM.
+    CHUNK_DURATION_SECONDS = 3600
     TARGET_SR = 44100  # The separation model expects 44100Hz
     original_sr = audio["sample_rate"]
+    original_waveform = audio["waveform"]
 
-    # Resample the entire audio to the target sample rate for the model
-    logger.debug(f"Resampling for separation model from {original_sr}Hz to {TARGET_SR}Hz")
-    full_mix_resampled = librosa.resample(audio["waveform"], orig_sr=original_sr, target_sr=TARGET_SR)
-    
-    chunk_size_frames = CHUNK_DURATION_SECONDS * TARGET_SR
-    separated_vocals_resampled = []
+    chunk_size_frames_orig = CHUNK_DURATION_SECONDS * original_sr
+    final_vocals_chunks = []
 
-    logger.info(f"Processing source separation in {CHUNK_DURATION_SECONDS}s chunks to conserve memory...")
-    # Process in chunks
-    for i in tqdm.tqdm(range(0, len(full_mix_resampled), chunk_size_frames), desc="Separating Chunks"):
-        chunk = full_mix_resampled[i:i + chunk_size_frames]
+    logger.info(f"Processing source separation in {CHUNK_DURATION_SECONDS}s chunks for speed and memory efficiency...")
+
+    # Process in chunks from the original waveform
+    for i in tqdm.tqdm(range(0, len(original_waveform), chunk_size_frames_orig), desc="Separating Chunks"):
+        # 1. Get a chunk from the original audio
+        original_chunk = original_waveform[i:i + chunk_size_frames_orig]
         
-        # The predictor handles mono-to-stereo conversion internally.
-        vocals_chunk, _ = predictor.predict(chunk)
+        # 2. Resample ONLY the small chunk up to the model's target SR
+        resampled_chunk = librosa.resample(original_chunk, orig_sr=original_sr, target_sr=TARGET_SR)
         
-        # The predictor output is stereo, we only need one channel.
-        separated_vocals_resampled.append(vocals_chunk[:, 0])
+        # 3. Predict on the small, resampled chunk
+        vocals_chunk_resampled, _ = predictor.predict(resampled_chunk)
+        
+        # 4. Resample ONLY the small result chunk back down to the original SR
+        # The predictor output is stereo, so we take one channel [:, 0]
+        vocals_chunk_original_sr = librosa.resample(vocals_chunk_resampled[:, 0], orig_sr=TARGET_SR, target_sr=original_sr)
+        
+        # 5. Append the final, processed chunk
+        final_vocals_chunks.append(vocals_chunk_original_sr)
 
-    # Concatenate the processed chunks
+    # Concatenate the processed chunks (which are already at the correct sample rate)
     logger.debug("Concatenating separated chunks...")
-    full_vocals_resampled = np.concatenate(separated_vocals_resampled)
-
-    # Resample the separated vocals back to the original sample rate
-    logger.debug(f"Resampling separated audio back to {original_sr}Hz...")
-    final_vocals = librosa.resample(full_vocals_resampled, orig_sr=TARGET_SR, target_sr=original_sr)
+    final_vocals = np.concatenate(final_vocals_chunks)
 
     # Update the audio object with the separated vocals
     audio["waveform"] = final_vocals
