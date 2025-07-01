@@ -544,7 +544,7 @@ if __name__ == "__main__":
     # Set up logger
     logger = Logger.get_logger()
     if args.quiet:
-        logger.setLevel(logging.WARNING)
+        logger.setLevel(logging.INFO)
 
 
     if args.input_folder_path and not args.input_file_path:

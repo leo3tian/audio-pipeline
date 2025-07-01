@@ -55,7 +55,7 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     """
 
     process = subprocess.Popen(cmd, shell=True, executable="/bin/bash", 
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                text=True, bufsize=1)
 
     if process.stdout:
@@ -64,12 +64,8 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
 
     process.wait()
     if process.returncode != 0:
-        error_output = process.stderr.read() if process.stderr else "No stderr output."
-        print(f"[!] Emilia error on GPU {device} for {input_wav_file}:\n---\n{error_output}\n---")
-        raise subprocess.CalledProcessError(process.returncode, cmd, output=None, stderr=error_output)
-    
-    # This print is now handled by the main worker loop
-    # print(f"GPU {device} - ✅ Successfully processed: {os.path.basename(input_wav_file)}")
+        print(f"[!] Emilia subprocess on GPU {device} failed for {input_wav_file}.")
+        raise subprocess.CalledProcessError(process.returncode, cmd)
 
 def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir: str, progress_counter):
     """
