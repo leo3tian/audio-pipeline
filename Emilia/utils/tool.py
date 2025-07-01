@@ -12,7 +12,7 @@ import time
 import torch
 from pydub import AudioSegment
 import soundfile as sf
-import onnxruntime-gpu as ort
+import onnxruntime as ort
 import tqdm
 import subprocess
 import re
@@ -117,6 +117,7 @@ def export_to_srt(asr_result, file_path):
 def detect_gpu():
     """Detect if GPU is available and print related information."""
     logger = Logger.get_logger()
+    print(ort.get_device())
 
     if "CUDA_VISIBLE_DEVICES" not in os.environ:
         logger.info("ENV: CUDA_VISIBLE_DEVICES not set, use default setting")
