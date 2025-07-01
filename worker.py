@@ -51,7 +51,7 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     emilia_script = os.path.abspath(EMILIA_PIPE_PATH)
     cmd = f"""
     source {conda_setup} && conda activate {conda_env} && export CUDA_VISIBLE_DEVICES={device} && \
-    python {emilia_script} --input_file_path '{input_wav_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir} --quiet'
+    python {emilia_script} --input_file_path '{input_wav_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}' --quiet
     """
 
     process = subprocess.Popen(cmd, shell=True, executable="/bin/bash", 
@@ -67,7 +67,7 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
         print(f"[!] Emilia subprocess on GPU {device} failed for {input_wav_file}.")
         raise subprocess.CalledProcessError(process.returncode, cmd)
 
-def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir: str, progress_counter):
+def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir: str, progress_counter, lock):
     """
     A worker process that uses a pre-sanitized index to read its slice of the dataset.
     """
@@ -104,7 +104,7 @@ def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir:
                 print(f"GPU {device} - ✅ Successfully processed and uploaded: {video_id}")
 
                 # Increment the shared counter on success
-                with progress_counter.get_lock():
+                with lock:
                     progress_counter.value += 1
                 
             except Exception as e:
@@ -185,6 +185,7 @@ def main():
         return
 
     manager = multiprocessing.Manager()
+    lock = manager.Lock()
     progress_counter = manager.Value('i', 0)
 
     monitor_process = multiprocessing.Process(target=progress_monitor, args=(progress_counter, total_samples))
@@ -193,12 +194,12 @@ def main():
     print(f"🚀 Starting {world_size} worker processes to process {total_samples} videos...")
     processes = []
     try:
-        for rank, device in enumerate(available_devices):
+        for rank, device in enumerate(available_devices): 
             worker_cache_dir = os.path.join(shared_cache_dir, f"worker_{rank}")
             os.makedirs(worker_cache_dir)
             shutil.copy(sanitized_index_path, os.path.join(worker_cache_dir, "index.json"))
 
-            p = multiprocessing.Process(target=processing_worker, args=(rank, world_size, device, worker_cache_dir, progress_counter))
+            p = multiprocessing.Process(target=processing_worker, args=(rank, world_size, device, worker_cache_dir, progress_counter, lock))
             p.start()
             processes.append(p)
 
