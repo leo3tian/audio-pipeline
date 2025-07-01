@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 import boto3
 from streaming import StreamingDataset
-import soundfile as sf
+import sys
 from itertools import islice # Import islice for manual sharding
 import time
 import tqdm
@@ -25,26 +25,18 @@ def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str
     files_to_upload = list(local_directory.rglob("*"))
     file_count = len(files_to_upload)
     if file_count == 0:
-        print(f"    No files found in {local_directory} to upload.")
         return
-    
-    # This function is called from within a worker, so we avoid printing the large file list
-    # print(f"    Uploading {file_count} files to s3://{s3_bucket}/{s3_prefix}...")
     
     for local_file in files_to_upload:
         if local_file.is_file():
             s3_key = f"{s3_prefix}/{local_file.relative_to(local_directory)}"
             s3_client.upload_file(str(local_file), s3_bucket, s3_key)
             
-    # print(f"    Finished uploading to s3://{s3_bucket}/{s3_prefix}")
-
-def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
+def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str, rank: int, statuses: list):
     """
-    Runs the Emilia-pipe on a specific audio file, capturing and streaming
-    its output in real-time with a worker-specific prefix.
+    Runs the Emilia-pipe, reporting its real-time status to a shared list
+    instead of printing directly to the console.
     """
-    # This print is now handled by the main worker loop
-    # print(f"GPU {device} - Processing file: {os.path.basename(input_wav_file)}")
     os.makedirs(output_dir, exist_ok=True)
     conda_setup = "/opt/conda/etc/profile.d/conda.sh"
     conda_env = "AudioPipeline"
@@ -58,18 +50,19 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                text=True, bufsize=1)
 
+    # Stream the merged output and update the shared status list
     if process.stdout:
         for line in iter(process.stdout.readline, ''):
-            print(f"    [GPU {device}] {line.strip()}", flush=True)
+            statuses[rank] = line.strip()
 
     process.wait()
     if process.returncode != 0:
-        print(f"[!] Emilia subprocess on GPU {device} failed for {input_wav_file}.")
+        statuses[rank] = f"ERROR: Subprocess failed. Check logs."
         raise subprocess.CalledProcessError(process.returncode, cmd)
-
-def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir: str, progress_counter):
+    
+def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir: str, progress_counter, statuses: list):
     """
-    A worker process that uses a pre-sanitized index to read its slice of the dataset.
+    A worker process that processes samples and reports its status to a shared list.
     """
     full_dataset = StreamingDataset(
         remote=S3_INPUT_DIR,
@@ -85,7 +78,7 @@ def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir:
         video_id = sample['video_id']
         audio_bytes = sample['audio']
         
-        print(f"GPU {device} (Rank {rank}) - Starting sample #{global_index}, video_id: {video_id}")
+        statuses[rank] = f"Starting sample #{global_index}, video_id: {video_id}"
 
         with tempfile.TemporaryDirectory(prefix=f"worker_{device}_") as temp_dir:
             try:
@@ -96,30 +89,56 @@ def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir:
                 with open(input_wav_path, 'wb') as f:
                     f.write(audio_bytes)
 
-                run_emilia_pipe(str(input_wav_path), str(emilia_output_dir), device)
+                run_emilia_pipe(str(input_wav_path), str(emilia_output_dir), device, rank, statuses)
                 
                 s3_bucket_name = S3_OUTPUT_DIR.split('//')[1].split('/')[0]
                 s3_prefix = f"processed/{video_id}"
+                statuses[rank] = f"Uploading results for {video_id}..."
                 upload_directory_to_s3(emilia_output_dir, s3_bucket_name, s3_prefix)
-                print(f"GPU {device} - ✅ Successfully processed and uploaded: {video_id}")
+                statuses[rank] = f"✅ Finished: {video_id}"
 
-                # Increment the shared counter on success
                 with progress_counter.get_lock():
                     progress_counter.value += 1
                 
             except Exception as e:
-                print(f"[!!!] CRITICAL FAILURE on GPU {device} for video_id {video_id}: {e}")
+                statuses[rank] = f"CRITICAL FAILURE on video_id {video_id}."
+                # The detailed error is now part of the subprocess log, so we don't print it here.
 
-def progress_monitor(counter, total):
-    """Monitors the shared counter and updates the tqdm progress bar."""
-    with tqdm.tqdm(total=total, desc="Overall Progress") as pbar:
-        last_value = 0
-        while last_value < total:
-            time.sleep(1) # Update every second
-            current_value = counter.value
-            if current_value > last_value:
-                pbar.update(current_value - last_value)
-                last_value = current_value
+def progress_monitor(counter, total, statuses, world_size):
+    """Monitors shared state and draws a clean, updating UI to the console."""
+    pbar = tqdm.tqdm(total=total, desc="Overall Progress", position=0, leave=True)
+    
+    # Pad the list to make sure we have a line for each worker
+    status_lines = list(statuses)
+    while len(status_lines) < world_size:
+        status_lines.append("...")
+
+    # Initial draw
+    for i in range(world_size):
+        print("")
+
+    while counter.value < total:
+        # Update the main progress bar
+        pbar.n = counter.value
+        pbar.refresh()
+        
+        # Move cursor up to the line above the first worker status
+        # The `+1` accounts for the master progress bar line
+        sys.stdout.write(f"\x1b[{world_size}A")
+        
+        # Redraw all worker status lines
+        for i in range(world_size):
+            # \x1b[K clears the line from the cursor to the end
+            line = statuses[i][:120] # Truncate long lines to prevent wrapping
+            print(f"  [GPU {i}] {line:<120}\x1b[K")
+        
+        sys.stdout.flush()
+        time.sleep(0.1) # UI refresh rate
+
+    pbar.n = total
+    pbar.refresh()
+    pbar.close()
+    print("\n" * world_size) # Move cursor down after finishing
 
 def get_available_gpus() -> list:
     """Detects available NVIDIA GPU indices."""
@@ -165,7 +184,6 @@ def main():
 
         index_data['shards'] = sanitized_shards
         
-        # Calculate total samples from the sanitized index
         total_samples = sum(shard['samples'] for shard in sanitized_shards)
 
         with open(sanitized_index_path, 'w') as f:
@@ -175,7 +193,6 @@ def main():
 
     except Exception as e:
         print(f"[!!!] Could not download or sanitize index.json: {e}")
-        print("[!!!] Aborting worker startup.")
         shutil.rmtree(shared_cache_dir, ignore_errors=True)
         return
     
@@ -186,11 +203,11 @@ def main():
 
     manager = multiprocessing.Manager()
     progress_counter = manager.Value('i', 0)
+    worker_statuses = manager.list(['Initializing...'] * world_size)
 
-    monitor_process = multiprocessing.Process(target=progress_monitor, args=(progress_counter, total_samples))
+    monitor_process = multiprocessing.Process(target=progress_monitor, args=(progress_counter, total_samples, worker_statuses, world_size))
     monitor_process.start()
 
-    print(f"🚀 Starting {world_size} worker processes to process {total_samples} videos...")
     processes = []
     try:
         for rank, device in enumerate(available_devices):
@@ -198,24 +215,27 @@ def main():
             os.makedirs(worker_cache_dir)
             shutil.copy(sanitized_index_path, os.path.join(worker_cache_dir, "index.json"))
 
-            p = multiprocessing.Process(target=processing_worker, args=(rank, world_size, device, worker_cache_dir, progress_counter))
+            p = multiprocessing.Process(target=processing_worker, args=(rank, world_size, device, worker_cache_dir, progress_counter, worker_statuses))
             p.start()
             processes.append(p)
 
         for p in processes:
             p.join()
         
-        # Wait for the monitor to finish. It will exit once the counter reaches the total.
+        time.sleep(1) # Give the monitor a moment to do its final update
         monitor_process.join()
 
+    except KeyboardInterrupt:
+        print("\n[!] Keyboard interrupt received. Terminating processes.")
     finally:
         if monitor_process.is_alive():
-            monitor_process.terminate() # Forcefully stop the monitor if it's still running
+            monitor_process.terminate()
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
         shutil.rmtree(shared_cache_dir, ignore_errors=True)
 
-    print("\n✅ Stage 2 Complete: All videos have been processed and uploaded to S3.")
-    print(f"➡️  Processed results are in bucket: {S3_OUTPUT_DIR}/")
-    print("➡️  Next step: Run 'finalize_dataset.py' to create the Hugging Face dataset.")
+    print(f"\n✅ Stage 2 Finished.")
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
