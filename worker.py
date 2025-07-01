@@ -51,7 +51,7 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     emilia_script = os.path.abspath(EMILIA_PIPE_PATH)
     cmd = f"""
     source {conda_setup} && conda activate {conda_env} && export CUDA_VISIBLE_DEVICES={device} && \
-    python {emilia_script} --input_file_path '{input_wav_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}'
+    python {emilia_script} --input_file_path '{input_wav_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir} --quiet'
     """
 
     process = subprocess.Popen(cmd, shell=True, executable="/bin/bash", 
