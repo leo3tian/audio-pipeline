@@ -9,6 +9,8 @@ import boto3
 from streaming import StreamingDataset
 import soundfile as sf
 from itertools import islice # Import islice for manual sharding
+import time
+import tqdm
 
 # --- Configuration ---
 S3_INPUT_DIR = os.getenv("S3_INPUT_DIR", "s3://yt-pipeline-bucket/streaming_dataset")
@@ -26,18 +28,23 @@ def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str
         print(f"    No files found in {local_directory} to upload.")
         return
     
-    print(f"    Uploading {file_count} files to s3://{s3_bucket}/{s3_prefix}...")
+    # This function is called from within a worker, so we avoid printing the large file list
+    # print(f"    Uploading {file_count} files to s3://{s3_bucket}/{s3_prefix}...")
     
     for local_file in files_to_upload:
         if local_file.is_file():
             s3_key = f"{s3_prefix}/{local_file.relative_to(local_directory)}"
             s3_client.upload_file(str(local_file), s3_bucket, s3_key)
             
-    print(f"    Finished uploading to s3://{s3_bucket}/{s3_prefix}")
+    # print(f"    Finished uploading to s3://{s3_bucket}/{s3_prefix}")
 
 def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
-    """Runs the Emilia-pipe on a specific audio file using a specific GPU."""
-    print(f"GPU {device} - Processing file: {input_wav_file}")
+    """
+    Runs the Emilia-pipe on a specific audio file, capturing and streaming
+    its output in real-time with a worker-specific prefix.
+    """
+    # This print is now handled by the main worker loop
+    # print(f"GPU {device} - Processing file: {os.path.basename(input_wav_file)}")
     os.makedirs(output_dir, exist_ok=True)
     conda_setup = "/opt/conda/etc/profile.d/conda.sh"
     conda_env = "AudioPipeline"
@@ -46,20 +53,28 @@ def run_emilia_pipe(input_wav_file: str, output_dir: str, device: str):
     source {conda_setup} && conda activate {conda_env} && export CUDA_VISIBLE_DEVICES={device} && \
     python {emilia_script} --input_file_path '{input_wav_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}'
     """
-    try:
-        subprocess.run(cmd, shell=True, executable="/bin/bash", check=True)
-        print(f"GPU {device} - ✅ Successfully processed: {input_wav_file}")
-    except subprocess.CalledProcessError as e:
-        error_message = e.stderr.decode()
-        print(f"[!] Emilia error on GPU {device} for {input_wav_file}:\n---\n{error_message}\n---")
-        raise
 
-def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir: str):
+    process = subprocess.Popen(cmd, shell=True, executable="/bin/bash", 
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                               text=True, bufsize=1)
+
+    if process.stdout:
+        for line in iter(process.stdout.readline, ''):
+            print(f"    [GPU {device}] {line.strip()}", flush=True)
+
+    process.wait()
+    if process.returncode != 0:
+        error_output = process.stderr.read() if process.stderr else "No stderr output."
+        print(f"[!] Emilia error on GPU {device} for {input_wav_file}:\n---\n{error_output}\n---")
+        raise subprocess.CalledProcessError(process.returncode, cmd, output=None, stderr=error_output)
+    
+    # This print is now handled by the main worker loop
+    # print(f"GPU {device} - ✅ Successfully processed: {os.path.basename(input_wav_file)}")
+
+def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir: str, progress_counter):
     """
     A worker process that uses a pre-sanitized index to read its slice of the dataset.
     """
-    # This worker's cache directory already contains a clean index.json.
-    # The library will use it and download the required shards from the remote.
     full_dataset = StreamingDataset(
         remote=S3_INPUT_DIR,
         local=worker_cache_dir,
@@ -67,15 +82,11 @@ def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir:
         batch_size=1
     )
 
-    # Create a unique slice of the dataset for this worker using islice.
     dataset_slice = islice(full_dataset, rank, None, world_size)
 
-    # Iterate over the unique slice of the dataset assigned to this worker
     for i, sample in enumerate(dataset_slice):
-        # The global index is rank + i * world_size
         global_index = rank + (i * world_size)
         video_id = sample['video_id']
-        # The audio from the streaming dataset is already in bytes
         audio_bytes = sample['audio']
         
         print(f"GPU {device} (Rank {rank}) - Starting sample #{global_index}, video_id: {video_id}")
@@ -85,21 +96,34 @@ def processing_worker(rank: int, world_size: int, device: str, worker_cache_dir:
                 temp_path = Path(temp_dir)
                 emilia_output_dir = temp_path / "processed"
                 
-                # Save the audio bytes from the sample to a temporary .wav file
                 input_wav_path = temp_path / f"{video_id}.wav"
                 with open(input_wav_path, 'wb') as f:
                     f.write(audio_bytes)
 
-                # --- 2. PROCESS with Emilia-pipe ---
                 run_emilia_pipe(str(input_wav_path), str(emilia_output_dir), device)
                 
-                # --- 3. UPLOAD processed results TO S3 ---
                 s3_bucket_name = S3_OUTPUT_DIR.split('//')[1].split('/')[0]
                 s3_prefix = f"processed/{video_id}"
                 upload_directory_to_s3(emilia_output_dir, s3_bucket_name, s3_prefix)
+                print(f"GPU {device} - ✅ Successfully processed and uploaded: {video_id}")
+
+                # Increment the shared counter on success
+                with progress_counter.get_lock():
+                    progress_counter.value += 1
                 
             except Exception as e:
                 print(f"[!!!] CRITICAL FAILURE on GPU {device} for video_id {video_id}: {e}")
+
+def progress_monitor(counter, total):
+    """Monitors the shared counter and updates the tqdm progress bar."""
+    with tqdm.tqdm(total=total, desc="Overall Progress") as pbar:
+        last_value = 0
+        while last_value < total:
+            time.sleep(1) # Update every second
+            current_value = counter.value
+            if current_value > last_value:
+                pbar.update(current_value - last_value)
+                last_value = current_value
 
 def get_available_gpus() -> list:
     """Detects available NVIDIA GPU indices."""
@@ -119,13 +143,11 @@ def main():
         print("[!] No GPUs detected. Aborting.")
         return
         
-    # Create a single shared cache directory for the sanitized index and worker caches
     shared_cache_dir = os.path.abspath("streaming_worker_cache")
     if os.path.exists(shared_cache_dir):
         shutil.rmtree(shared_cache_dir)
     os.makedirs(shared_cache_dir)
 
-    # --- Sanitize index.json before starting workers ---
     print("Sanitizing remote dataset index...")
     try:
         s3_client = boto3.client("s3")
@@ -146,36 +168,53 @@ def main():
             print(f"  Found and removed {original_shard_count - len(sanitized_shards)} empty/invalid shards from the index.")
 
         index_data['shards'] = sanitized_shards
+        
+        # Calculate total samples from the sanitized index
+        total_samples = sum(shard['samples'] for shard in sanitized_shards)
 
         with open(sanitized_index_path, 'w') as f:
             json.dump(index_data, f)
         
-        print("  Sanitized index.json created locally.")
+        print(f"  Sanitized index.json created locally. Total samples: {total_samples}")
 
     except Exception as e:
         print(f"[!!!] Could not download or sanitize index.json: {e}")
         print("[!!!] Aborting worker startup.")
         shutil.rmtree(shared_cache_dir, ignore_errors=True)
         return
-    # --- End Sanitization ---
+    
+    if total_samples == 0:
+        print("[!] Dataset is empty after sanitization. Nothing to process.")
+        shutil.rmtree(shared_cache_dir, ignore_errors=True)
+        return
 
-    print(f"🚀 Starting {world_size} worker processes...")
+    manager = multiprocessing.Manager()
+    progress_counter = manager.Value('i', 0)
+
+    monitor_process = multiprocessing.Process(target=progress_monitor, args=(progress_counter, total_samples))
+    monitor_process.start()
+
+    print(f"🚀 Starting {world_size} worker processes to process {total_samples} videos...")
     processes = []
     try:
         for rank, device in enumerate(available_devices):
-            # Create a unique cache dir for each worker and copy the clean index into it
             worker_cache_dir = os.path.join(shared_cache_dir, f"worker_{rank}")
             os.makedirs(worker_cache_dir)
             shutil.copy(sanitized_index_path, os.path.join(worker_cache_dir, "index.json"))
 
-            p = multiprocessing.Process(target=processing_worker, args=(rank, world_size, device, worker_cache_dir))
+            p = multiprocessing.Process(target=processing_worker, args=(rank, world_size, device, worker_cache_dir, progress_counter))
             p.start()
             processes.append(p)
 
         for p in processes:
             p.join()
+        
+        # Wait for the monitor to finish. It will exit once the counter reaches the total.
+        monitor_process.join()
+
     finally:
-        # Clean up the shared cache directory at the end
+        if monitor_process.is_alive():
+            monitor_process.terminate() # Forcefully stop the monitor if it's still running
         shutil.rmtree(shared_cache_dir, ignore_errors=True)
 
     print("\n✅ Stage 2 Complete: All videos have been processed and uploaded to S3.")
