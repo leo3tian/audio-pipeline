@@ -12,7 +12,7 @@ import time
 import torch
 from pydub import AudioSegment
 import soundfile as sf
-import onnxruntime as ort
+import onnxruntime-gpu as ort
 import tqdm
 import subprocess
 import re
