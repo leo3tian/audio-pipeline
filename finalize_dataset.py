@@ -86,13 +86,13 @@ def finalize_and_upload():
             continue
         
         for i, segment in enumerate(segments):
-            mp3_filename = f"{video_id}_{i}.mp3"
+            mp3_filename = f"{video_id}_{i:06d}.mp3"
             # This path is now a "virtual" path. The data loader will know to look inside the tars for it.
             hf_audio_path = f"audio/{mp3_filename}"
             s3_audio_key = f"{s3_video_prefix}{mp3_filename}"
             
             new_record = {
-                "id": f"{video_id}_{i}", "audio": hf_audio_path, "text": segment.get("text", ""),
+                "id": f"{video_id}_{i:06d}", "audio": hf_audio_path, "text": segment.get("text", ""),
                 "speaker_id": segment.get("speaker", "UNKNOWN"), "duration": segment.get("end", 0) - segment.get("start", 0),
                 "dnsmos": segment.get("dnsmos", 0.0), "language": segment.get("language", "UNKNOWN"),
                 "_s3_key": s3_audio_key # We'll use this to find the file in S3
