@@ -117,7 +117,7 @@ def export_to_srt(asr_result, file_path):
 def detect_gpu():
     """Detect if GPU is available and print related information."""
     logger = Logger.get_logger()
-    print(ort.get_device())
+    # print(ort.get_device())
 
     if "CUDA_VISIBLE_DEVICES" not in os.environ:
         logger.info("ENV: CUDA_VISIBLE_DEVICES not set, use default setting")
