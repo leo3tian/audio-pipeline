@@ -372,7 +372,7 @@ def mos_prediction(audio, vad_list):
         start, end = int(vad["start"] * sample_rate), int(vad["end"] * sample_rate)
         segment = audio[start:end]
 
-        dnsmos = dnsmos_compute_score(segment, sample_rate, False)["MOS"]
+        dnsmos = dnsmos_compute_score(segment, sample_rate, False)["OVRL"]
 
         vad_list[index]["dnsmos"] = dnsmos
 
