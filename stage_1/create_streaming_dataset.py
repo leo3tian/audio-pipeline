@@ -117,18 +117,23 @@ def main():
     
     print(f"\nFound a total of {len(all_video_urls)} videos to process.")
     
-    # Create a stable local directory for the MDSWriter cache.
-    mds_cache_dir = "mds_writer_cache"
+    # Create a stable local directory for all temporary files.
+    mds_cache_dir = os.path.abspath("mds_writer_cache")
     if os.path.exists(mds_cache_dir):
         shutil.rmtree(mds_cache_dir)
     os.makedirs(mds_cache_dir)
     
-    # Create a single parent temporary directory for the entire run
+    # *** FIX: Set the TMPDIR environment variable ***
+    # This forces all underlying tempfile operations (used by MDSWriter)
+    # to use our stable directory instead of the system's /tmp.
+    os.environ['TMPDIR'] = mds_cache_dir
+    
+    # Create a separate parent temporary directory for yt-dlp downloads
     main_temp_dir = tempfile.mkdtemp(prefix="streaming_parent_")
     try:
         with open(FAILED_URLS_LOG, "w") as f_failures:
-            # By providing a `local` path, we prevent MDSWriter from using /tmp
-            with MDSWriter(out=S3_OUTPUT_DIR, local=mds_cache_dir, columns=DATASET_COLUMNS) as writer:
+            # *** FIX: Removed the unsupported `local` argument ***
+            with MDSWriter(out=S3_OUTPUT_DIR, columns=DATASET_COLUMNS) as writer:
                 with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
                     
                     task_counter = itertools.count(start=1)
@@ -144,13 +149,9 @@ def main():
                         try:
                             future.result()
                         except Exception as exc:
-                            # This exception is now more likely to be a genuine download error
-                            # rather than a writer thread crash.
                             print(f'\n[!!!] Task #{task_num} for URL {url} generated an exception: {exc}')
                             f_failures.write(f'{url}\n')
 
-                            # The cooldown logic might still be useful for actual rate-limiting,
-                            # but it's less likely to be triggered by writer failures now.
                             with cooldown_lock:
                                 if cooldown_event.is_set():
                                     print(f"\n[!!!] An error occurred. Initiating {COOLDOWN_PERIOD_SECONDS}-second cooldown as a precaution...")
