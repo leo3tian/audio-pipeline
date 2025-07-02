@@ -26,8 +26,6 @@ def claim_video_task(s3_client):
     and returns the task details.
     """
     todo_prefix = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_todo/')
-    
-    # List objects in the todo directory to find a task
     paginator = s3_client.get_paginator('list_objects_v2')
     pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=todo_prefix, MaxKeys=10)
     
@@ -47,7 +45,6 @@ def claim_video_task(s3_client):
             in_progress_key = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_in_progress', f"{video_id}.task")
 
             try:
-                # Atomic move: Copy the object, then delete the original.
                 s3_client.copy_object(
                     Bucket=S3_BUCKET,
                     CopySource={'Bucket': S3_BUCKET, 'Key': task_key},
@@ -55,26 +52,39 @@ def claim_video_task(s3_client):
                 )
                 s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
                 
-                # Retrieve the content (URL) of the claimed task
                 task_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=in_progress_key)
                 video_url = task_obj['Body'].read().decode('utf-8')
                 
                 return {'key': in_progress_key, 'url': video_url, 'video_id': video_id}
             
             except ClientError as e:
-                # This can happen in a race condition if another worker claims the task first.
                 if e.response['Error']['Code'] in ['NoSuchKey', '404']:
-                    continue # Try the next task
+                    continue
                 else:
-                    raise # Re-raise other S3 errors
-    return None # No tasks found
+                    raise
+    return None
 
 def complete_video_task(s3_client, task_key):
-    """Moves a completed video task file to the 'videos_completed' directory."""
+    """
+    Moves a completed video task file to the 'videos_completed' directory.
+    This is now robust against race conditions where another worker completes the task first.
+    """
     video_id = os.path.basename(task_key).replace('.task', '')
     completed_key = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_completed', f"{video_id}.task")
-    s3_client.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': task_key}, Key=completed_key)
-    s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
+    try:
+        # Check if the in-progress file still exists before trying to move it.
+        s3_client.head_object(Bucket=S3_BUCKET, Key=task_key)
+        
+        # If it exists, move it.
+        s3_client.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': task_key}, Key=completed_key)
+        s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
+    except ClientError as e:
+        # If the key is not found, it means another worker already completed it. This is not an error.
+        if e.response['Error']['Code'] == '404':
+            print(f"  Note: Task {video_id} was already completed by another worker.")
+        else:
+            # Re-raise other unexpected S3 errors.
+            raise
 
 def download_and_convert_to_flac(video_url: str, temp_dir: Path):
     """Downloads a single video and converts it to a standardized FLAC file."""
@@ -83,18 +93,17 @@ def download_and_convert_to_flac(video_url: str, temp_dir: Path):
         'outtmpl': str(temp_dir / '%(id)s.%(ext)s'),
         'quiet': True,
         'ignoreerrors': True,
-        'cookiefile': '/home/ec2-user/cookies.txt' # Assumes cookies are in this path
+        'cookiefile': '/home/ec2-user/cookies.txt'
     }
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         if not info:
-            raise ValueError("yt-dlp returned no info, download likely failed.")
+            raise ValueError("yt-dlp returned no info")
         
         video_id = info['id']
         input_path = ydl.prepare_filename(info)
         output_path = temp_dir / f"{video_id}.flac"
 
-        # Use ffmpeg to convert to a standardized FLAC format
         ffmpeg_cmd = [
             'ffmpeg', '-i', str(input_path), '-vn', '-ar', str(SAMPLE_RATE),
             '-ac', '1', '-sample_fmt', 's16', str(output_path)
@@ -125,14 +134,12 @@ def downloader_worker(rank: int):
                 print(f"  Downloader-{rank}: Uploading {video_id}.flac to S3...")
                 s3_client.upload_file(str(flac_path), S3_BUCKET, s3_key)
             
-            # If upload is successful, mark the task as complete
             complete_video_task(s3_client, video_task['key'])
             print(f"  Downloader-{rank}: ✅ Finished and completed task for video: {video_id}")
 
         except Exception as e:
             print(f"  Downloader-{rank}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
-            # The failed task remains in the 'in_progress' folder for the janitor to handle.
-            time.sleep(10) # Pause before trying to claim a new task
+            time.sleep(10)
 
 def main():
     """Orchestrates the pool of downloader worker processes."""
