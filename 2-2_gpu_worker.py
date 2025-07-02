@@ -24,7 +24,8 @@ def claim_processing_task(s3_client):
     Atomically claims a task by listing and then attempting to delete it.
     The first worker to successfully delete the task from 'todo' wins the claim.
     """
-    todo_prefix = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_todo/')
+    # This prefix points to the to-do list for the GPU workers
+    todo_prefix = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_todo/')
     paginator = s3_client.get_paginator('list_objects_v2')
     pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=todo_prefix, MaxKeys=10)
     
@@ -41,20 +42,19 @@ def claim_processing_task(s3_client):
                 continue
             
             try:
-                # First, get the content of the task file (the URL)
+                # First, get the content of the task file (the video_id)
                 task_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=task_key)
-                video_url = task_obj['Body'].read().decode('utf-8')
+                video_id = task_obj['Body'].read().decode('utf-8')
                 
                 # Now, attempt the atomic delete operation to claim the task.
                 s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
                 
                 # If the delete succeeded, we have claimed the task.
                 # We now create the 'in_progress' file to track it.
-                video_id = os.path.basename(task_key).replace('.task', '')
-                in_progress_key = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_in_progress', f"{video_id}.task")
-                s3_client.put_object(Bucket=S3_BUCKET, Key=in_progress_key, Body=video_url)
+                in_progress_key = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_in_progress', f"{video_id}.task")
+                s3_client.put_object(Bucket=S3_BUCKET, Key=in_progress_key, Body=video_id)
 
-                return {'key': in_progress_key, 'url': video_url, 'video_id': video_id}
+                return {'key': in_progress_key, 'video_id': video_id}
 
             except ClientError as e:
                 # If we get a NoSuchKey error, it means another worker deleted it first.
