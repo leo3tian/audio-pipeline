@@ -15,7 +15,7 @@ S3_BUCKET = "yt-pipeline-bucket"
 S3_RAW_AUDIO_PREFIX = "raw_audio/"
 S3_PROCESSED_PREFIX = "processed/"
 S3_TASKS_BASE_PREFIX = "tasks/"
-EMILIA_WORKERS = 4 # Number of GPU workers to run per instance
+EMILIA_WORKERS = 6 # Number of GPU workers to run per instance
 EMILIA_PIPE_PATH = "Emilia/main.py"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
 
