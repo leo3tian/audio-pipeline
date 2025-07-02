@@ -21,38 +21,79 @@ EMILIA_CONFIG_PATH = "Emilia/config.json"
 
 def claim_processing_task(s3_client):
     """
-    Finds a task in 'processing_todo/', moves it to 'processing_in_progress/',
-    and returns the video_id.
+    Atomically claims a task by listing and then attempting to delete it.
+    The first worker to successfully delete the task from 'todo' wins the claim.
     """
-    todo_prefix = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_todo/')
+    todo_prefix = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_todo/')
     paginator = s3_client.get_paginator('list_objects_v2')
     pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=todo_prefix, MaxKeys=10)
     
     for page in pages:
-        if 'Contents' not in page: continue
+        if 'Contents' not in page:
+            continue
+        
         tasks = page['Contents']
         random.shuffle(tasks)
+
         for obj in tasks:
             task_key = obj['Key']
-            if not task_key.endswith('.task'): continue
+            if not task_key.endswith('.task'):
+                continue
             
-            video_id = os.path.basename(task_key).replace('.task', '')
-            in_progress_key = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_in_progress', f"{video_id}.task")
             try:
-                s3_client.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': task_key}, Key=in_progress_key)
+                # First, get the content of the task file (the URL)
+                task_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=task_key)
+                video_url = task_obj['Body'].read().decode('utf-8')
+                
+                # Now, attempt the atomic delete operation to claim the task.
                 s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
-                return {'key': in_progress_key, 'video_id': video_id}
+                
+                # If the delete succeeded, we have claimed the task.
+                # We now create the 'in_progress' file to track it.
+                video_id = os.path.basename(task_key).replace('.task', '')
+                in_progress_key = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_in_progress', f"{video_id}.task")
+                s3_client.put_object(Bucket=S3_BUCKET, Key=in_progress_key, Body=video_url)
+
+                return {'key': in_progress_key, 'url': video_url, 'video_id': video_id}
+
             except ClientError as e:
-                if e.response['Error']['Code'] in ['NoSuchKey', '404']: continue
-                else: raise
-    return None
+                # If we get a NoSuchKey error, it means another worker deleted it first.
+                # We lost the race, so we just continue to the next available task.
+                if e.response['Error']['Code'] in ['NoSuchKey', '404']:
+                    continue
+                else:
+                    # Re-raise any other unexpected S3 errors.
+                    raise
+    return None # No tasks found
 
 def complete_processing_task(s3_client, task_key):
-    """Moves a completed processing task file."""
+    """
+    Moves a completed processing task file to the 'processing_completed' directory.
+    This is now robust against race conditions where another worker completes the task first.
+    """
     video_id = os.path.basename(task_key).replace('.task', '')
     completed_key = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_completed', f"{video_id}.task")
-    s3_client.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': task_key}, Key=completed_key)
-    s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
+    try:
+        # First, check if the in-progress file still exists before trying to move it.
+        s3_client.head_object(Bucket=S3_BUCKET, Key=task_key)
+        
+        # If it exists, it means we are the first worker to finish. Move it.
+        s3_client.copy_object(
+            Bucket=S3_BUCKET,
+            CopySource={'Bucket': S3_BUCKET, 'Key': task_key},
+            Key=completed_key
+        )
+        s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
+
+    except ClientError as e:
+        # If head_object returns a 404 error, it means another worker already completed this task.
+        # This is an expected outcome of the race condition, so we can safely ignore it.
+        if e.response['Error']['Code'] == '404':
+            print(f"  Note: Task for {video_id} was already completed by another worker.")
+        else:
+            # If it's a different error, we should raise it to be aware of other potential issues.
+            print(f"  Warning: Unexpected S3 error while completing task {task_key}: {e}")
+            raise
 
 def run_emilia_pipe(input_flac_file: str, output_dir: str, device: str):
     """Runs the Emilia-pipe on a specific audio file using a specific GPU."""
