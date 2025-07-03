@@ -34,3 +34,6 @@ processed/
 *.m4a
 *.json
 *.zip
+
+# Old versions
+old/
