@@ -111,7 +111,7 @@ def download_and_convert_to_flac(video_url: str, temp_dir: Path):
         subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
         return output_path
 
-def downloader_worker(rank: int):
+def downloader_worker(rank: int, failure_counter):
     """A worker process that continuously claims and processes video download tasks."""
     s3_client = boto3.client('s3')
     print(f"Downloader-{rank}: Starting...")
@@ -139,20 +139,32 @@ def downloader_worker(rank: int):
 
         except Exception as e:
             print(f"  Downloader-{rank}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
+            # --- MODIFIED: Increment the shared failure counter ---
+            with failure_counter.get_lock():
+                failure_counter.value += 1
             time.sleep(10)
 
 def main():
     """Orchestrates the pool of downloader worker processes."""
+    # --- MODIFIED: Create a manager and a shared failure counter ---
+    manager = multiprocessing.Manager()
+    failure_counter = manager.Value('i', 0)
+    
     processes = []
     print(f"🚀 Starting {NUM_WORKERS} downloader worker processes...")
     for i in range(NUM_WORKERS):
-        p = multiprocessing.Process(target=downloader_worker, args=(i,))
+        # --- MODIFIED: Pass the failure counter to each worker ---
+        p = multiprocessing.Process(target=downloader_worker, args=(i, failure_counter))
         p.start()
         processes.append(p)
 
     for p in processes:
         p.join()
+        
+    # --- MODIFIED: Print the final failure count ---
     print("\n✅ All downloader workers have finished.")
+    print(f"    Total failures: {failure_counter.value}")
+
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
