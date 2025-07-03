@@ -18,7 +18,7 @@ S3_TASKS_BASE_PREFIX = "tasks/"
 # The audio format and sample rate we will standardize to.
 SAMPLE_RATE = 24000
 # Number of downloader processes to run per instance.
-NUM_WORKERS = 8 # multiprocessing.cpu_count()
+NUM_WORKERS =  multiprocessing.cpu_count()
 
 def claim_video_task(s3_client):
     """
