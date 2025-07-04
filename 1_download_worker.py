@@ -19,6 +19,7 @@ S3_TASKS_BASE_PREFIX = "tasks/"
 SAMPLE_RATE = 24000
 # Number of downloader processes to run per instance.
 NUM_WORKERS =  multiprocessing.cpu_count()
+MAX_CONSECUTIVE_FAILURES = 10
 
 def claim_video_task(s3_client):
     """
@@ -118,6 +119,10 @@ def downloader_worker(rank: int, failure_counter):
     
     while True:
         video_task = claim_video_task(s3_client)
+        if failure_counter.value >= MAX_CONSECUTIVE_FAILURES:
+            print(f"Downloader-{rank}: Max failures reached ({MAX_CONSECUTIVE_FAILURES}). Exiting.")
+            break
+
         if not video_task:
             print(f"Downloader-{rank}: No more video tasks found. Exiting.")
             break
@@ -136,6 +141,8 @@ def downloader_worker(rank: int, failure_counter):
             
             complete_video_task(s3_client, video_task['key'])
             print(f"  Downloader-{rank}: ✅ Finished and completed task for video: {video_id}")
+            with failure_counter.get_lock():
+                failure_counter.value = 0
 
         except Exception as e:
             print(f"  Downloader-{rank}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
