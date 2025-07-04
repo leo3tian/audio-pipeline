@@ -19,7 +19,7 @@ S3_TASKS_BASE_PREFIX = "tasks/"
 SAMPLE_RATE = 24000
 # Number of downloader processes to run per instance.
 NUM_WORKERS =  multiprocessing.cpu_count()
-MAX_CONSECUTIVE_FAILURES = 10
+MAX_CONSECUTIVE_FAILURES = 6
 
 def claim_video_task(s3_client):
     """
