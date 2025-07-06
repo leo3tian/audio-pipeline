@@ -141,14 +141,12 @@ def downloader_worker(rank: int, failure_counter):
             
             complete_video_task(s3_client, video_task['key'])
             print(f"  Downloader-{rank}: ✅ Finished and completed task for video: {video_id}")
-            with failure_counter.get_lock():
-                failure_counter.value = 0
+            failure_counter.value = 0
 
         except Exception as e:
             print(f"  Downloader-{rank}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
             # --- MODIFIED: Increment the shared failure counter ---
-            with failure_counter.get_lock():
-                failure_counter.value += 1
+            failure_counter.value += 1
             time.sleep(10)
 
 def main():
