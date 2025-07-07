@@ -20,6 +20,7 @@ SAMPLE_RATE = 24000
 # Number of downloader processes to run per instance.
 NUM_WORKERS =  multiprocessing.cpu_count()
 MAX_CONSECUTIVE_FAILURES = 20
+NUM_COOKIES = 4
 
 def claim_video_task(s3_client):
     """
@@ -87,14 +88,14 @@ def complete_video_task(s3_client, task_key):
             # Re-raise other unexpected S3 errors.
             raise
 
-def download_and_convert_to_flac(video_url: str, temp_dir: Path):
+def download_and_convert_to_flac(video_url: str, temp_dir: Path, cookie_num: int):
     """Downloads a single video and converts it to a standardized FLAC file."""
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': str(temp_dir / '%(id)s.%(ext)s'),
         'quiet': True,
         'ignoreerrors': True,
-        'cookiefile': '/home/ec2-user/cookies.txt'
+        'cookiefile': '/home/ec2-user/cookies{cookie_num}.txt'
     }
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
@@ -133,7 +134,7 @@ def downloader_worker(rank: int, failure_counter):
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                flac_path = download_and_convert_to_flac(video_url, Path(temp_dir))
+                flac_path = download_and_convert_to_flac(video_url, Path(temp_dir), rank % NUM_COOKIES)
                 
                 s3_key = f"{S3_RAW_AUDIO_PREFIX}{video_id}.flac"
                 print(f"  Downloader-{rank}: Uploading {video_id}.flac to S3...")
