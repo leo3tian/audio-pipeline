@@ -9,7 +9,7 @@ S3_BUCKET = "yt-pipeline-bucket"
 S3_TASKS_PREFIX = "tasks/videos_todo/"
 # The list of YouTube channel URLs you want to process
 CHANNEL_URLS = [
-    "https://www.youtube.com/@mostlynitpicking/videos"
+    "https://youtube.com/playlist?list=PL22egh3ok4cP0T7UZRmP6TMLErZYWMN-l&si=jeAEGxEPX4JbJ1Zy"
 ]
 
 def main():
