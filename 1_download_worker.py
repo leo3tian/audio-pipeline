@@ -95,7 +95,7 @@ def download_and_convert_to_flac(video_url: str, temp_dir: Path, cookie_num: int
         'outtmpl': str(temp_dir / '%(id)s.%(ext)s'),
         'quiet': True,
         'ignoreerrors': True,
-        'cookiefile': '/home/ec2-user/cookies{cookie_num}.txt'
+        'cookiefile': f'/home/ec2-user/cookies{cookie_num}.txt'
     }
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
