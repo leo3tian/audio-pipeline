@@ -62,9 +62,8 @@ def claim_processing_task(s3_client):
                 if e.response['Error']['Code'] in ['NoSuchKey', '404']:
                     continue
                 else:
-                    # Re-raise any other unexpected S3 errors.
-                    raise
-    return None # No tasks found
+                    raise # unexpected errors
+    return None
 
 def complete_processing_task(s3_client, task_key):
     """
