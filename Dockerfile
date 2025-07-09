@@ -29,7 +29,7 @@ COPY . .
 # --- Create Conda env and install dependencies ---
 # Added boto3 for AWS S3 access
 RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
-    /opt/conda/bin/conda run -n AudioPipeline pip install yt-dlp huggingface_hub datasets boto3 mosaicml-streaming soundfile && \
+    /opt/conda/bin/conda run -n AudioPipeline pip install yt-dlp huggingface_hub datasets boto3 soundfile && \
     /opt/conda/bin/conda run -n AudioPipeline bash -c "cd Emilia && bash env.sh"
 
 # --- Pre-cache models to prevent race conditions ---
