@@ -13,7 +13,7 @@ import random
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
 S3_PROCESSED_PREFIX = "processed/"
-HF_REPO_ID = os.environ.get("HF_REPO_ID", "leo-fixie/videos-test")
+HF_REPO_ID = os.environ.get("HF_REPO_ID", "fixie-ai/joe_rogan_youtube")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 FILES_PER_TAR_BATCH = 5000 
 S3_TASKS_BASE_PREFIX = "tasks/"
