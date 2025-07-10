@@ -19,6 +19,9 @@ MAX_EMILIA_WORKERS = 9999 # Number of GPU workers to run per instance
 EMILIA_PIPE_PATH = "Emilia/main.py"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
 
+# --- Emilia Config --- 
+BATCH_SIZE = 64
+
 def claim_processing_task(s3_client):
     """
     Atomically claims a task by listing and then attempting to delete it.
@@ -102,7 +105,7 @@ def run_emilia_pipe(input_flac_file: str, output_dir: str, device: str):
     emilia_script = os.path.abspath(EMILIA_PIPE_PATH)
     cmd = f"""
     export CUDA_VISIBLE_DEVICES={device} && \
-    python {emilia_script} --input_file_path '{input_flac_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}' --quiet
+    python {emilia_script} --input_file_path '{input_flac_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}' --quiet --batch_size {BATCH_SIZE} 
     """
     try:
         subprocess.run(cmd, shell=True, executable="/bin/bash", check=True, capture_output=True, text=True)
