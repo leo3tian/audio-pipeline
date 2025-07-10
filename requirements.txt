@@ -1,0 +1,18 @@
+# Main project dependencies
+boto3
+tqdm
+huggingface_hub
+datasets
+soundfile
+yt-dlp
+
+# Dependencies from Emilia/requirements.txt
+librosa
+numpy
+pydub
+pyannote.audio
+pandas
+git+https://github.com/m-bain/whisperx.git
+
+# Dependency from env.sh
+onnxruntime-gpu
