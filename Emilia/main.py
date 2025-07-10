@@ -103,7 +103,7 @@ def source_separation(predictor, audio):
     """
     # Define chunk size in seconds. 60 minutes = 3600 seconds.
     # This value can be increased for a potential performance boost on machines with high RAM.
-    CHUNK_DURATION_SECONDS = 3600
+    CHUNK_DURATION_SECONDS = 7200 # TWEAK: increased from 60 minutes to 2 hours
     TARGET_SR = 44100  # The separation model expects 44100Hz
     original_sr = audio["sample_rate"]
     original_waveform = audio["waveform"]
