@@ -15,7 +15,7 @@ S3_BUCKET = "yt-pipeline-bucket"
 S3_RAW_AUDIO_PREFIX = "raw_audio/"
 S3_PROCESSED_PREFIX = "processed/"
 S3_TASKS_BASE_PREFIX = "tasks/"
-EMILIA_WORKERS = 6 # Number of GPU workers to run per instance
+MAX_EMILIA_WORKERS = 9999 # Number of GPU workers to run per instance
 EMILIA_PIPE_PATH = "Emilia/main.py"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
 
@@ -170,7 +170,7 @@ def get_available_gpus() -> list:
 def main():
     """Orchestrates the pool of GPU worker processes."""
     processes = []
-    available_devices = get_available_gpus()[:EMILIA_WORKERS]
+    available_devices = get_available_gpus()[:MAX_EMILIA_WORKERS]
     world_size = len(available_devices)
 
     if world_size == 0:

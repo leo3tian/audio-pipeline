@@ -1,0 +1,39 @@
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+env/
+venv/
+*.env
+
+# Logs and outputs
+*.log
+*.out
+
+# Jupyter and IDE files
+*.ipynb
+.vscode/
+*.swp
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Downloaded data
+downloads/
+processed/
+*_processed/
+
+# Temp files
+*.wav
+*.mp3
+*.flac
+*.aac
+*.m4a
+*.json
+*.zip
+
+# Old versions
+old/
