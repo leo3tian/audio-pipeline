@@ -104,7 +104,7 @@ def run_emilia_pipe(input_flac_file: str, output_dir: str, device: str):
     conda_env = "AudioPipeline" # Assumes this conda env exists
     emilia_script = os.path.abspath(EMILIA_PIPE_PATH)
     cmd = f"""
-    export CUDA_VISIBLE_DEVICES={device} && \
+    source {conda_setup} && conda activate {conda_env} && export CUDA_VISIBLE_DEVICES={device} && \
     python {emilia_script} --input_file_path '{input_flac_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}' --quiet --batch_size {BATCH_SIZE} 
     """
     try:

@@ -9,7 +9,7 @@ print("--- Caching models from Torch Hub ---")
 try:
     print("Caching Silero VAD model...")
     # This command downloads the model to the torch hub cache inside the image.
-    torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', onnx=True)
+    torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', onnx=True, trust_repo=True)
     print("✅ Silero VAD model cached successfully.")
 
     # If you had other models from torch.hub, you would add them here.
