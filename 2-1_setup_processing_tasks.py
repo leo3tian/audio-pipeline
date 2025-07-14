@@ -3,16 +3,18 @@ import boto3
 import tqdm
 
 # --- Configuration ---
-S3_BUCKET = "yt-pipeline-bucket"
+S3_BUCKET = "sptfy-dataset"
 # The location of the raw audio files from Stage 1
 S3_RAW_AUDIO_PREFIX = "raw_audio/"
 # The S3 "folder" where the GPU processing tasks will be created
 S3_TASKS_PREFIX = "tasks/processing_todo/"
+# A tuple of supported audio file extensions
+SUPPORTED_EXTENSIONS = ('.flac', '.mp3', '.wav', '.m4a', '.aac', '.ogg', '.wma')
 
 def main():
     """
     Scans the raw_audio/ directory in S3 and creates a processing task
-    for each .flac file found.
+    for each supported audio file found.
     """
     print(f"Starting task setup for audio files in s3://{S3_BUCKET}/{S3_RAW_AUDIO_PREFIX}")
     s3_client = boto3.client("s3")
@@ -27,8 +29,12 @@ def main():
             continue
         
         for obj in page['Contents']:
-            if obj['Key'].endswith('.flac'):
-                video_id = os.path.basename(obj['Key']).replace('.flac', '')
+            # Check if the file ends with any of the supported extensions
+            if obj['Key'].endswith(SUPPORTED_EXTENSIONS):
+                # Robustly get the filename without the extension
+                base_name = os.path.basename(obj['Key'])
+                video_id = os.path.splitext(base_name)[0]
+                
                 task_key = f"{S3_TASKS_PREFIX}{video_id}.task"
                 
                 # The content of the task is just the video_id
@@ -36,7 +42,7 @@ def main():
                 tasks_created += 1
     
     if tasks_created == 0:
-        print("\n[!] No .flac files found. No tasks were created.")
+        print("\n[!] No supported audio files found. No tasks were created.")
         return
 
     print(f"\n✅ GPU task setup complete.")
