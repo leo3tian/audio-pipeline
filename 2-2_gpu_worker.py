@@ -135,17 +135,22 @@ def processing_worker(rank: int, device: str):
 
     # 2. Load ASR Model
     asr_model = whisper_asr.load_asr_model(
-        WHISPER_ARCH, device_name, compute_type=COMPUTE_TYPE, threads=CPU_THREADS
+        whisper_arch=WHISPER_ARCH,
+        device="cuda",
+        device_index=int(device),
+        compute_type=COMPUTE_TYPE,
+        threads=CPU_THREADS,
+        asr_options=cfg.get("asr") # Pass ASR options from config if they exist
     )
 
     # 3. Load VAD Model
     vad_model = silero_vad.SileroVAD(device=torch_device)
 
     # 4. Load Background Noise Separation Model
-    separator_model = separate_fast.Predictor(args=cfg["separate"]["step1"], device=device_name)
+    separator_model = separate_fast.Predictor(args=cfg["separate"]["step1"], device="cuda")
 
     # 5. Load DNSMOS Scoring Model
-    dnsmos_model = dnsmos.ComputeScore(cfg["mos_model"]["primary_model_path"], device_name)
+    dnsmos_model = dnsmos.ComputeScore(cfg["mos_model"]["primary_model_path"], "cuda")
     
     # Pack all models into the structured dictionary for easy passing
     models: ModelPack = {

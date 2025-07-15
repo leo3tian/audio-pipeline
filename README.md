@@ -13,7 +13,7 @@ In the root directory of this project, build the docker container:
 `docker build -t emilia-pipeline .`
 
 Then run the docker container:
-`docker run -it --env-file .env --gpus all -v $(pwd):/workspace -w /workspace -it emilia-pipeline`
+`docker run --rm -it --env-file .env --gpus all -v $(pwd):/workspace -w /workspace -it emilia-pipeline`
 
 Pick what youtube channels to download by editing CHANNEL_URLS in `0_get_urls.py` - ensure compliance with video copyright
 
