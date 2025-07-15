@@ -15,12 +15,12 @@ S3_BUCKET = os.environ.get("WORKER_BUCKET") # "sptfy-dataset" # yt-pipeline-buck
 S3_RAW_AUDIO_PREFIX = "raw-audio/" # raw_audio for yt
 S3_PROCESSED_PREFIX = "processed/"
 S3_TASKS_BASE_PREFIX = "tasks/"
-MAX_EMILIA_WORKERS = os.environ.get("MAX_EMILIA_WORKERS", 9999) # Number of GPU workers to run per instance
+MAX_EMILIA_WORKERS = int(os.environ.get("MAX_EMILIA_WORKERS", 9999)) # Number of GPU workers to run per instance
 EMILIA_PIPE_PATH = "Emilia/main.py"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
 
 # --- Emilia Config --- 
-BATCH_SIZE = 16
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 12))
 
 def claim_processing_task(s3_client):
     """
