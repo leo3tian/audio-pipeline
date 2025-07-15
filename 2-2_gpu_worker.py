@@ -9,115 +9,153 @@ import boto3
 from botocore.exceptions import ClientError
 import time
 import random
+import torch
+
+## REFACTOR: Import the necessary functions and classes for model loading
+## and for calling the refactored main processing pipeline.
+from pyannote.audio import Pipeline
+from Emilia.main import main_process, ModelPack # Our refactored pipeline function
+from Emilia.models import separate_fast, dnsmos, whisper_asr, silero_vad
+from Emilia.utils.tool import load_cfg
 
 # --- Configuration ---
 S3_BUCKET = os.environ.get("WORKER_BUCKET") # "sptfy-dataset" # yt-pipeline-bucket
 S3_RAW_AUDIO_PREFIX = "raw-audio/" # raw_audio for yt
 S3_PROCESSED_PREFIX = "processed/"
 S3_TASKS_BASE_PREFIX = "tasks/"
-MAX_EMILIA_WORKERS = int(os.environ.get("MAX_EMILIA_WORKERS", 9999)) # Number of GPU workers to run per instance
-EMILIA_PIPE_PATH = "Emilia/main.py"
+MAX_EMILIA_WORKERS = int(os.environ.get("MAX_EMILIA_WORKERS", 9999))
+# EMILIA_PIPE_PATH is no longer needed as we call the function directly.
 EMILIA_CONFIG_PATH = "Emilia/config.json"
 
-# --- Emilia Config --- 
+# --- Emilia Config ---
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 12))
+## REFACTOR: Define ASR model parameters here for the worker to use.
+WHISPER_ARCH = "medium"
+COMPUTE_TYPE = "float16"
+CPU_THREADS = 4
+
 
 def claim_processing_task(s3_client):
     """
     Atomically claims a task by listing and then attempting to delete it.
     The first worker to successfully delete the task from 'todo' wins the claim.
     """
-    # This prefix points to the to-do list for the GPU workers
     todo_prefix = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_todo/')
     paginator = s3_client.get_paginator('list_objects_v2')
     pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=todo_prefix, MaxKeys=10)
-    
+
     for page in pages:
         if 'Contents' not in page:
             continue
-        
-        tasks = page['Contents']
+
+        tasks = page.get('Contents', [])
         random.shuffle(tasks)
 
         for obj in tasks:
             task_key = obj['Key']
             if not task_key.endswith('.task'):
                 continue
-            
+
             try:
-                # First, get the content of the task file (the video_id)
                 task_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=task_key)
                 video_id = task_obj['Body'].read().decode('utf-8')
-                
-                # Now, attempt the atomic delete operation to claim the task.
+
                 s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
-                
-                # If the delete succeeded, we have claimed the task.
-                # We now create the 'in_progress' file to track it.
+
                 in_progress_key = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_in_progress', f"{video_id}.task")
                 s3_client.put_object(Bucket=S3_BUCKET, Key=in_progress_key, Body=video_id)
 
                 return {'key': in_progress_key, 'video_id': video_id}
 
             except ClientError as e:
-                # If we get a NoSuchKey error, it means another worker deleted it first.
-                # We lost the race, so we just continue to the next available task.
                 if e.response['Error']['Code'] in ['NoSuchKey', '404']:
                     continue
                 else:
-                    raise # unexpected errors
+                    raise
     return None
 
 def complete_processing_task(s3_client, task_key):
     """
     Moves a completed processing task file to the 'processing_completed' directory.
-    This is now robust against race conditions where another worker completes the task first.
     """
     video_id = os.path.basename(task_key).replace('.task', '')
     completed_key = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_completed', f"{video_id}.task")
     try:
-        # First, check if the in-progress file still exists before trying to move it.
         s3_client.head_object(Bucket=S3_BUCKET, Key=task_key)
-        
-        # If it exists, it means we are the first worker to finish. Move it.
         s3_client.copy_object(
             Bucket=S3_BUCKET,
             CopySource={'Bucket': S3_BUCKET, 'Key': task_key},
             Key=completed_key
         )
         s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
-
     except ClientError as e:
-        # If head_object returns a 404 error, it means another worker already completed this task.
-        # This is an expected outcome of the race condition, so we can safely ignore it.
         if e.response['Error']['Code'] == '404':
             print(f"  Note: Task for {video_id} was already completed by another worker.")
         else:
-            # If it's a different error, we should raise it to be aware of other potential issues.
             print(f"  Warning: Unexpected S3 error while completing task {task_key}: {e}")
             raise
 
-def run_emilia_pipe(input_flac_file: str, output_dir: str, device: str):
-    """Runs the Emilia-pipe on a specific audio file using a specific GPU."""
-    os.makedirs(output_dir, exist_ok=True)
-    conda_setup = "/opt/conda/etc/profile.d/conda.sh"
-    conda_env = "AudioPipeline" # Assumes this conda env exists
-    emilia_script = os.path.abspath(EMILIA_PIPE_PATH)
-    cmd = f"""
-    source {conda_setup} && conda activate {conda_env} && export CUDA_VISIBLE_DEVICES={device} && \
-    python {emilia_script} --input_file_path '{input_flac_file}' --config_path '{EMILIA_CONFIG_PATH}' --output_dir '{output_dir}' --quiet --batch_size {BATCH_SIZE} 
-    """
-    try:
-        subprocess.run(cmd, shell=True, executable="/bin/bash", check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        print(f"[!] Emilia error on GPU {device} for {input_flac_file}:\n---\n{e.stderr}\n---")
-        raise
+## REFACTOR: The run_emilia_pipe function is no longer needed because we are
+## calling the main_process function directly, avoiding the slow subprocess overhead.
+# def run_emilia_pipe(...):
+#     ...
 
 def processing_worker(rank: int, device: str):
-    """A worker process that continuously claims and processes audio files."""
+    """
+    A worker process that loads models once, then continuously claims and processes audio files.
+    """
     s3_client = boto3.client('s3')
     print(f"GPU-{device} (Rank {rank}): Starting...")
+
+    # --------------------------------------------------------------------------
+    ## REFACTOR: LOAD MODELS ONCE PER WORKER
+    # This entire block loads the AI models into memory *before* the task loop starts.
+    # This is the core of the performance optimization.
+    # --------------------------------------------------------------------------
+    print(f"GPU-{device} (Rank {rank}): Loading all models into memory...")
     
+    torch_device = torch.device(f"cuda:{device}")
+    device_name = f"cuda:{device}"
+
+    # Load config file
+    cfg = load_cfg(EMILIA_CONFIG_PATH)
+    cfg["huggingface_token"] = os.getenv("HF_TOKEN")
+
+    # 1. Load Speaker Diarization Model
+    if not cfg["huggingface_token"] or not cfg["huggingface_token"].startswith("hf"):
+        raise ValueError("Hugging Face token is missing or invalid.")
+    diarizer_model = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1", use_auth_token=cfg["huggingface_token"]
+    )
+    diarizer_model.to(torch_device)
+
+    # 2. Load ASR Model
+    asr_model = whisper_asr.load_asr_model(
+        WHISPER_ARCH, device_name, compute_type=COMPUTE_TYPE, threads=CPU_THREADS
+    )
+
+    # 3. Load VAD Model
+    vad_model = silero_vad.SileroVAD(device=torch_device)
+
+    # 4. Load Background Noise Separation Model
+    separator_model = separate_fast.Predictor(args=cfg["separate"]["step1"], device=device_name)
+
+    # 5. Load DNSMOS Scoring Model
+    dnsmos_model = dnsmos.ComputeScore(cfg["mos_model"]["primary_model_path"], device_name)
+    
+    # Pack all models into the structured dictionary for easy passing
+    models: ModelPack = {
+        "separator": separator_model,
+        "diarizer": diarizer_model,
+        "vad": vad_model,
+        "asr": asr_model,
+        "dnsmos": dnsmos_model,
+    }
+    print(f"GPU-{device} (Rank {rank}): All models loaded successfully.")
+    # --------------------------------------------------------------------------
+    # END OF MODEL LOADING BLOCK
+    # --------------------------------------------------------------------------
+
     while True:
         task = claim_processing_task(s3_client)
         if not task:
@@ -129,29 +167,39 @@ def processing_worker(rank: int, device: str):
 
         try:
             with tempfile.TemporaryDirectory(prefix=f"gpu_worker_{device}_") as temp_dir:
-                # 1. Find the exact audio file key using a prefix search
+                # 1. Find and download the audio file from S3
                 s3_search_prefix = f"{S3_RAW_AUDIO_PREFIX}{video_id}"
                 print(f"  GPU-{device}: Searching for audio file with prefix '{s3_search_prefix}'...")
                 
-                # List objects with the video_id as a prefix. We only need the first result.
                 response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_search_prefix, MaxKeys=1)
-                
                 if 'Contents' not in response or not response['Contents']:
                     raise FileNotFoundError(f"Could not find any audio file for video_id: {video_id}")
 
-                # We found a file. Get its full key.
                 s3_audio_key = response['Contents'][0]['Key']
-                
-                # 2. Download the exact file we found
                 local_filename = os.path.basename(s3_audio_key)
                 local_audio_path = Path(temp_dir) / local_filename
                 print(f"  GPU-{device}: Found and downloading {s3_audio_key}...")
                 s3_client.download_file(S3_BUCKET, s3_audio_key, str(local_audio_path))
 
-                # 3. Run the Emilia processing pipeline
+                # --------------------------------------------------------------------------
+                ## REFACTOR: DIRECTLY CALL THE PROCESSING PIPELINE
+                # Instead of a slow subprocess, we now call the Python function directly,
+                # passing the pre-loaded models for maximum efficiency.
+                # --------------------------------------------------------------------------
                 emilia_output_dir = Path(temp_dir) / "processed"
+                os.makedirs(emilia_output_dir, exist_ok=True)
                 print(f"  GPU-{device}: Starting Emilia pipe for {video_id}...")
-                run_emilia_pipe(str(local_audio_path), str(emilia_output_dir), device)
+                
+                main_process(
+                    audio_path=str(local_audio_path),
+                    models=models,
+                    cfg=cfg,
+                    device=torch_device,
+                    batch_size=BATCH_SIZE,
+                    save_path=str(emilia_output_dir),
+                    audio_name=video_id
+                )
+                # --------------------------------------------------------------------------
 
                 # 4. Upload the processed results
                 s3_processed_prefix = f"{S3_PROCESSED_PREFIX}{video_id}"
@@ -163,7 +211,10 @@ def processing_worker(rank: int, device: str):
             print(f"  GPU-{device}: ✅ Finished and completed task for video: {video_id}")
 
         except Exception as e:
+            # Basic error handling. Consider moving the task to a 'failed' queue here.
             print(f"  GPU-{device}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
+            # In a production system, you'd want to move the task to a failed state
+            # instead of just sleeping.
             time.sleep(10)
 
 def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str):
@@ -180,7 +231,8 @@ def get_available_gpus() -> list:
         output = subprocess.check_output(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"])
         return [line.strip() for line in output.decode("utf-8").splitlines()]
     except Exception:
-        return ["0"]
+        # Fallback for systems without nvidia-smi or GPUs
+        return []
 
 def main():
     """Orchestrates the pool of GPU worker processes."""
@@ -205,5 +257,6 @@ def main():
     print("\n✅ All GPU workers have finished.")
 
 if __name__ == "__main__":
+    # 'spawn' is a safer start method for multiprocessing with CUDA
     multiprocessing.set_start_method("spawn", force=True)
     main()
