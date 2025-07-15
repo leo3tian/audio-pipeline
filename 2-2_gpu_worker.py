@@ -11,11 +11,11 @@ import time
 import random
 
 # --- Configuration ---
-S3_BUCKET = "sptfy-dataset" # yt-pipeline-bucket
+S3_BUCKET = os.environ.get("WORKER_BUCKET") # "sptfy-dataset" # yt-pipeline-bucket
 S3_RAW_AUDIO_PREFIX = "raw-audio/" # raw_audio for yt
 S3_PROCESSED_PREFIX = "processed/"
 S3_TASKS_BASE_PREFIX = "tasks/"
-MAX_EMILIA_WORKERS = 9999 # Number of GPU workers to run per instance
+MAX_EMILIA_WORKERS = os.environ.get("MAX_EMILIA_WORKERS", 9999) # Number of GPU workers to run per instance
 EMILIA_PIPE_PATH = "Emilia/main.py"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
 
