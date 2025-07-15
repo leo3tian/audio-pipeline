@@ -16,7 +16,6 @@ import torch
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
 import pandas as pd
-## REFACTOR: Import TypedDict for creating a structured dictionary for our models.
 from typing import TypedDict
 
 from utils.tool import (
@@ -33,30 +32,26 @@ from models import separate_fast, dnsmos, whisper_asr, silero_vad
 warnings.filterwarnings("ignore")
 audio_count = 0
 
-## REFACTOR: Define a class to act as a type hint for the dictionary containing our models.
-## This makes the code cleaner and easier to understand.
 class ModelPack(TypedDict):
     separator: separate_fast.Predictor
     diarizer: Pipeline
     vad: silero_vad.SileroVAD
-    asr: whisper_asr.WhisperASR
+    ## FIX: Changed the type hint from whisper_asr.WhisperASR to 'object'.
+    ## The load_asr_model function returns a model object, not a class.
+    ## Using a generic type hint prevents the AttributeError during import.
+    asr: object
     dnsmos: dnsmos.ComputeScore
 
 # The logger is initialized globally so it can be accessed by all functions.
 logger = Logger.get_logger()
+# Set the logger level to DEBUG to print all messages, including timings.
+logger.setLevel(logging.DEBUG)
+
 
 @time_logger
-## REFACTOR: The 'cfg' dictionary is now passed as an argument.
 def standardization(audio, cfg):
     """
     Preprocess the audio file, including setting sample rate, bit depth, channels, and volume normalization.
-
-    Args:
-        audio (str or AudioSegment): Audio file path or AudioSegment object.
-        cfg (dict): The configuration dictionary.
-
-    Returns:
-        dict: A dictionary containing the preprocessed audio waveform, name, and sample rate.
     """
     global audio_count
     name = "audio"
@@ -72,7 +67,6 @@ def standardization(audio, cfg):
 
     logger.debug("Entering the preprocessing of audio")
 
-    # Convert the audio file to WAV format using settings from the config
     audio = audio.set_frame_rate(cfg["entrypoint"]["SAMPLE_RATE"])
     audio = audio.set_sample_width(2)
     audio = audio.set_channels(1)
@@ -97,11 +91,9 @@ def standardization(audio, cfg):
     }
 
 @time_logger
-## REFACTOR: The source separation model ('predictor') is now passed as an argument.
 def source_separation(predictor, audio):
     """
     Separate the audio into vocals and non-vocals using the given predictor.
-    This version processes the audio in chunks to avoid memory errors.
     """
     CHUNK_DURATION_SECONDS = 3600
     TARGET_SR = 44100
@@ -126,24 +118,14 @@ def source_separation(predictor, audio):
     return audio
 
 @time_logger
-## REFACTOR: The diarization pipeline and device are now passed as arguments.
 def speaker_diarization(audio, dia_pipeline, device):
     """
     Perform speaker diarization on the given audio.
-
-    Args:
-        audio (dict): A dictionary containing the audio waveform and sample rate.
-        dia_pipeline (pyannote.audio.Pipeline): The pre-loaded speaker diarization model.
-        device (torch.device): The device (CPU or CUDA) to run the model on.
-
-    Returns:
-        pd.DataFrame: A dataframe containing segments with speaker labels.
     """
     logger.debug(f"Start speaker diarization")
     waveform = torch.tensor(audio["waveform"]).to(device)
     waveform = torch.unsqueeze(waveform, 0)
 
-    # Use the passed-in diarization model
     segments = dia_pipeline(
         {"waveform": waveform, "sample_rate": audio["sample_rate"], "channel": 0}
     )
@@ -159,7 +141,7 @@ def speaker_diarization(audio, dia_pipeline, device):
 @time_logger
 def cut_by_speaker_label(vad_list):
     """
-    Merge and trim VAD segments by speaker labels. (No changes needed here)
+    Merge and trim VAD segments by speaker labels.
     """
     MERGE_GAP = 2
     MIN_SEGMENT_LENGTH = 3
@@ -209,25 +191,13 @@ def cut_by_speaker_label(vad_list):
     return filter_list
 
 @time_logger
-## REFACTOR: Pass the ASR model, batch size, and config dictionary as arguments.
 def asr(vad_segments, audio, asr_model, batch_size, cfg):
     """
     Perform Automatic Speech Recognition (ASR) on the VAD segments.
-
-    Args:
-        vad_segments (list): List of VAD segments with start and end times.
-        audio (dict): A dictionary containing the audio waveform and sample rate.
-        asr_model (whisper_asr.WhisperASR): The pre-loaded ASR model.
-        batch_size (int): The batch size for transcription.
-        cfg (dict): The configuration dictionary.
-
-    Returns:
-        list: A list of ASR results with transcriptions and language details.
     """
     if len(vad_segments) == 0:
         return []
 
-    # Get language settings from the passed-in config
     multilingual_flag = cfg["language"]["multilingual"]
     supported_languages = cfg["language"]["supported"]
 
@@ -294,7 +264,6 @@ def asr(vad_segments, audio, asr_model, batch_size, cfg):
             return []
 
 @time_logger
-## REFACTOR: Pass the DNSMOS model and config as arguments.
 def mos_prediction(audio, vad_list, dnsmos_model, cfg):
     """
     Predict the Mean Opinion Score (MOS) for the given audio and VAD segments.
@@ -310,7 +279,6 @@ def mos_prediction(audio, vad_list, dnsmos_model, cfg):
         start, end = int(vad["start"] * sample_rate), int(vad["end"] * sample_rate)
         segment = audio_resampled[start:end]
         
-        # Use the passed-in DNSMOS model
         dnsmos_score = dnsmos_model(segment, sample_rate, False)["OVRL"]
         vad_list[index]["dnsmos"] = dnsmos_score
 
@@ -321,7 +289,6 @@ def mos_prediction(audio, vad_list, dnsmos_model, cfg):
 def filter(mos_list):
     """
     Filter out the segments with MOS scores, wrong char duration, and total duration.
-    (No changes needed here)
     """
     filtered_audio_stats, all_audio_stats = calculate_audio_stats(mos_list)
     filtered_segment = len(filtered_audio_stats)
@@ -333,10 +300,6 @@ def filter(mos_list):
     all_list = [mos_list[idx] for idx, _ in all_audio_stats]
     return filtered_list, all_list
 
-
-## REFACTOR: This is the main refactored function.
-## It now accepts the pre-loaded models and other necessary configs,
-## avoiding the need for global variables and enabling efficient reuse.
 @time_logger
 def main_process(
     audio_path: str,
@@ -349,15 +312,6 @@ def main_process(
 ):
     """
     Process an audio file using pre-loaded models.
-
-    Args:
-        audio_path (str): Path to the audio file.
-        models (ModelPack): A dictionary containing all the pre-loaded models.
-        cfg (dict): The configuration dictionary.
-        device (torch.device): The device (CPU or CUDA) to run models on.
-        batch_size (int): The batch size for ASR.
-        save_path (str, optional): Directory to save outputs.
-        audio_name (str, optional): Name for the output files.
     """
     if not audio_path.endswith((".mp3", ".wav", ".flac", ".m4a", ".aac")):
         logger.warning(f"Unsupported file type: {audio_path}")
@@ -373,20 +327,16 @@ def main_process(
     audio = standardization(audio_path, cfg)
 
     logger.info("Step 1: Source Separation")
-    ## REFACTOR: Pass the separator model from the 'models' dictionary.
     audio = source_separation(models["separator"], audio)
 
     logger.info("Step 2: Speaker Diarization")
-    ## REFACTOR: Pass the diarizer model and device.
     speakerdia = speaker_diarization(audio, models["diarizer"], device)
 
     logger.info("Step 3: Fine-grained Segmentation by VAD")
-    ## REFACTOR: Call the 'vad' method on the VAD model from the 'models' dictionary.
     vad_list = models["vad"].vad(speakerdia, audio)
     segment_list = cut_by_speaker_label(vad_list)
 
     logger.info("Step 4: ASR")
-    ## REFACTOR: Pass the ASR model, batch size, and config.
     asr_result = asr(segment_list, audio, models["asr"], batch_size, cfg)
     if not asr_result:
         logger.warning(f"No valid ASR result for {audio_name}, skipping.")
@@ -394,7 +344,6 @@ def main_process(
 
     logger.info("Step 5: Filter")
     logger.info("Step 5.1: MOS Prediction")
-    ## REFACTOR: Pass the DNSMOS model and config.
     avg_mos, mos_list = mos_prediction(audio, asr_result, models["dnsmos"], cfg)
     logger.info(f"Step 5.1: done, average MOS: {avg_mos}")
 
@@ -429,7 +378,6 @@ if __name__ == "__main__":
     parser.add_argument("--exit_pipeline", type=bool, default=False)
     args = parser.parse_args()
 
-    # Set up logger
     if args.quiet:
         logger.setLevel(logging.WARNING)
 
@@ -452,11 +400,7 @@ if __name__ == "__main__":
         args.compute_type = "int8"
 
     check_env(logger)
-
-    ## REFACTOR: This section remains for when you run main.py directly.
-    ## The models are loaded here, then passed to main_process.
     
-    # 1. Load Speaker Diarization Model
     logger.debug(" * Loading Speaker Diarization Model")
     if not cfg["huggingface_token"] or not cfg["huggingface_token"].startswith("hf"):
         raise ValueError("Hugging Face token is missing or invalid.")
@@ -465,7 +409,6 @@ if __name__ == "__main__":
     )
     dia_pipeline.to(device)
 
-    # 2. Load ASR Model
     logger.debug(" * Loading ASR Model")
     asr_model = whisper_asr.load_asr_model(
         args.whisper_arch,
@@ -477,20 +420,16 @@ if __name__ == "__main__":
         },
     )
 
-    # 3. Load VAD Model
     logger.debug(" * Loading VAD Model")
     vad_model = silero_vad.SileroVAD(device=device)
 
-    # 4. Load Background Noise Separation Model
-    logger.debug(" * Loading Background Noise Model")
+    logger.debug(" * Loading Background Noise Separation Model")
     separator_model = separate_fast.Predictor(args=cfg["separate"]["step1"], device=device_name)
 
-    # 5. Load DNSMOS Scoring Model
     logger.debug(" * Loading DNSMOS Model")
     dnsmos_model = dnsmos.ComputeScore(cfg["mos_model"]["primary_model_path"], device_name)
     logger.debug("All models loaded")
 
-    ## REFACTOR: Pack all loaded models into the 'ModelPack' dictionary.
     models: ModelPack = {
         "separator": separator_model,
         "diarizer": dia_pipeline,
@@ -504,7 +443,6 @@ if __name__ == "__main__":
              raise FileNotFoundError(f"Input file not found: {args.input_file_path}")
         logger.info(f"Processing single file: {args.input_file_path}")
         
-        ## REFACTOR: Call main_process with the new arguments.
         main_process(
             audio_path=args.input_file_path,
             models=models,
@@ -526,7 +464,6 @@ if __name__ == "__main__":
             audio_name = os.path.splitext(os.path.basename(path))[0]
             specific_save_path = os.path.join(args.output_dir, audio_name) if args.output_dir else None
             
-            ## REFACTOR: Call main_process with the new arguments for each file.
             main_process(
                 audio_path=path,
                 models=models,

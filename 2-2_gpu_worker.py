@@ -10,10 +10,14 @@ from botocore.exceptions import ClientError
 import time
 import random
 import torch
+import sys
 
-## REFACTOR: Import the necessary functions and classes for model loading
-## and for calling the refactored main processing pipeline.
 from pyannote.audio import Pipeline
+
+emilia_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'Emilia'))
+if emilia_path not in sys.path:
+    sys.path.insert(0, emilia_path)
+
 from Emilia.main import main_process, ModelPack # Our refactored pipeline function
 from Emilia.models import separate_fast, dnsmos, whisper_asr, silero_vad
 from Emilia.utils.tool import load_cfg
