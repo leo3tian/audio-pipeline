@@ -129,29 +129,41 @@ def processing_worker(rank: int, device: str):
 
         try:
             with tempfile.TemporaryDirectory(prefix=f"gpu_worker_{device}_") as temp_dir:
-                # 1. Download the raw audio file from S3
-                input_flac_key = f"{S3_RAW_AUDIO_PREFIX}{video_id}.flac"
-                local_flac_path = Path(temp_dir) / f"{video_id}.flac"
-                print(f"  GPU-{device}: Downloading {input_flac_key}...")
-                s3_client.download_file(S3_BUCKET, input_flac_key, str(local_flac_path))
+                # 1. Find the exact audio file key using a prefix search
+                s3_search_prefix = f"{S3_RAW_AUDIO_PREFIX}{video_id}"
+                print(f"  GPU-{device}: Searching for audio file with prefix '{s3_search_prefix}'...")
+                
+                # List objects with the video_id as a prefix. We only need the first result.
+                response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_search_prefix, MaxKeys=1)
+                
+                if 'Contents' not in response or not response['Contents']:
+                    raise FileNotFoundError(f"Could not find any audio file for video_id: {video_id}")
 
-                # 2. Run the Emilia processing pipeline
+                # We found a file. Get its full key.
+                s3_audio_key = response['Contents'][0]['Key']
+                
+                # 2. Download the exact file we found
+                local_filename = os.path.basename(s3_audio_key)
+                local_audio_path = Path(temp_dir) / local_filename
+                print(f"  GPU-{device}: Found and downloading {s3_audio_key}...")
+                s3_client.download_file(S3_BUCKET, s3_audio_key, str(local_audio_path))
+
+                # 3. Run the Emilia processing pipeline
                 emilia_output_dir = Path(temp_dir) / "processed"
                 print(f"  GPU-{device}: Starting Emilia pipe for {video_id}...")
-                run_emilia_pipe(str(local_flac_path), str(emilia_output_dir), device)
+                run_emilia_pipe(str(local_audio_path), str(emilia_output_dir), device)
 
-                # 3. Upload the processed results
+                # 4. Upload the processed results
                 s3_processed_prefix = f"{S3_PROCESSED_PREFIX}{video_id}"
                 print(f"  GPU-{device}: Uploading processed results for {video_id}...")
                 upload_directory_to_s3(emilia_output_dir, S3_BUCKET, s3_processed_prefix)
             
-            # 4. Mark the task as complete
+            # 5. Mark the task as complete
             complete_processing_task(s3_client, task['key'])
             print(f"  GPU-{device}: ✅ Finished and completed task for video: {video_id}")
 
         except Exception as e:
             print(f"  GPU-{device}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
-            # The failed task remains in 'in_progress' for the janitor to handle.
             time.sleep(10)
 
 def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str):
