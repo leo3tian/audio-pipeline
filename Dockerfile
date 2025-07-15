@@ -7,6 +7,7 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 RUN apt-get update -qq && \
     apt-get install -y -qq \
     git wget ffmpeg curl build-essential bzip2 libsndfile1 python3 python3-pip unzip && \
+    apt-get install -y libsox-dev && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip install boto3

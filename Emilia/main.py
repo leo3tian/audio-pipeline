@@ -17,6 +17,10 @@ from pydub import AudioSegment
 from pyannote.audio import Pipeline
 import pandas as pd
 from typing import TypedDict
+import threading
+from queue import Queue
+## OPTIMIZATION: Import soxr for high-performance resampling
+import soxr
 
 from utils.tool import (
     export_to_mp3,
@@ -36,15 +40,11 @@ class ModelPack(TypedDict):
     separator: separate_fast.Predictor
     diarizer: Pipeline
     vad: silero_vad.SileroVAD
-    ## FIX: Changed the type hint from whisper_asr.WhisperASR to 'object'.
-    ## The load_asr_model function returns a model object, not a class.
-    ## Using a generic type hint prevents the AttributeError during import.
     asr: object
     dnsmos: dnsmos.ComputeScore
 
 # The logger is initialized globally so it can be accessed by all functions.
 logger = Logger.get_logger()
-# Set the logger level to DEBUG to print all messages, including timings.
 logger.setLevel(logging.DEBUG)
 
 
@@ -93,29 +93,80 @@ def standardization(audio, cfg):
 @time_logger
 def source_separation(predictor, audio):
     """
-    Separate the audio into vocals and non-vocals using the given predictor.
+    Separate audio into vocals and non-vocals using a three-stage pipeline
+    to maximize GPU utilization.
     """
-    CHUNK_DURATION_SECONDS = 3600
+    ## OPTIMIZATION: Reduced chunk size for better pipeline flow and lower memory use.
+    CHUNK_DURATION_SECONDS = 600 # 10 minutes
     TARGET_SR = 44100
     original_sr = audio["sample_rate"]
     original_waveform = audio["waveform"]
-
     chunk_size_frames_orig = CHUNK_DURATION_SECONDS * original_sr
+    
+    # --- Pipeline Queues ---
+    # Queue for chunks resampled UP, ready for the GPU
+    to_gpu_queue = Queue(maxsize=2)
+    # Queue for chunks predicted by the GPU, ready for final resampling DOWN
+    from_gpu_queue = Queue(maxsize=2)
+
     final_vocals_chunks = []
+    
+    # --- Stage 1: Producer Thread (CPU) ---
+    def producer():
+        """Reads audio, resamples it UP to the target SR, and puts it in the to_gpu_queue."""
+        for i in range(0, len(original_waveform), chunk_size_frames_orig):
+            original_chunk = original_waveform[i:i + chunk_size_frames_orig]
+            resampled_chunk = soxr.resample(original_chunk, original_sr, TARGET_SR, quality='hq')
+            to_gpu_queue.put(resampled_chunk)
+        # Signal that production is finished
+        to_gpu_queue.put(None)
 
-    logger.info(f"Processing source separation in {CHUNK_DURATION_SECONDS}s chunks...")
+    # --- Stage 3: Post-Processor Thread (CPU) ---
+    def post_processor():
+        """Takes predicted chunks from from_gpu_queue, resamples them DOWN, and appends to the final list."""
+        while True:
+            predicted_chunk = from_gpu_queue.get()
+            if predicted_chunk is None:
+                break
+            vocals_chunk_original_sr = soxr.resample(predicted_chunk[:, 0], TARGET_SR, original_sr, quality='hq')
+            final_vocals_chunks.append(vocals_chunk_original_sr)
 
-    for i in tqdm.tqdm(range(0, len(original_waveform), chunk_size_frames_orig), desc="Separating Chunks"):
-        original_chunk = original_waveform[i:i + chunk_size_frames_orig]
-        resampled_chunk = librosa.resample(original_chunk, orig_sr=original_sr, target_sr=TARGET_SR)
+    # --- Start background threads ---
+    producer_thread = threading.Thread(target=producer)
+    post_processor_thread = threading.Thread(target=post_processor)
+    producer_thread.start()
+    post_processor_thread.start()
+
+    # --- Stage 2: Main Consumer Loop (GPU) ---
+    num_chunks = (len(original_waveform) + chunk_size_frames_orig - 1) // chunk_size_frames_orig
+    logger.info(f"Fully optimized source separation started for {num_chunks} chunks...")
+    
+    for _ in tqdm.tqdm(range(num_chunks), desc="Separating Chunks"):
+        # 1. Get a chunk that's ready for the GPU
+        resampled_chunk = to_gpu_queue.get()
+        if resampled_chunk is None:
+            break
+        
+        # 2. Run the GPU prediction
         vocals_chunk_resampled, _ = predictor.predict(resampled_chunk)
-        vocals_chunk_original_sr = librosa.resample(vocals_chunk_resampled[:, 0], orig_sr=TARGET_SR, target_sr=original_sr)
-        final_vocals_chunks.append(vocals_chunk_original_sr)
+        
+        # 3. Pass the result to the post-processor
+        from_gpu_queue.put(vocals_chunk_resampled)
 
+    # --- Cleanup ---
+    # Signal the post-processor to finish
+    from_gpu_queue.put(None)
+    
+    # Wait for both background threads to complete their work
+    producer_thread.join()
+    post_processor_thread.join()
+
+    # --- Final Assembly ---
     final_vocals = np.concatenate(final_vocals_chunks)
     audio["waveform"] = final_vocals
     logger.info("Source separation complete.")
     return audio
+
 
 @time_logger
 def speaker_diarization(audio, dia_pipeline, device):
@@ -211,9 +262,10 @@ def asr(vad_segments, audio, asr_model, batch_size, cfg):
     for idx, segment in enumerate(vad_segments):
         vad_segments[idx]["start"] -= start_time
         vad_segments[idx]["end"] -= start_time
-
-    temp_audio = librosa.resample(
-        temp_audio, orig_sr=audio["sample_rate"], target_sr=16000
+    
+    # Using soxr here as well for consistency and speed
+    temp_audio = soxr.resample(
+        temp_audio, audio["sample_rate"], 16000, quality='hq'
     )
 
     if multilingual_flag:
@@ -271,8 +323,9 @@ def mos_prediction(audio, vad_list, dnsmos_model, cfg):
     audio_waveform = audio["waveform"]
     sample_rate = 16000
 
-    audio_resampled = librosa.resample(
-        audio_waveform, orig_sr=cfg["entrypoint"]["SAMPLE_RATE"], target_sr=sample_rate
+    # Using soxr here as well for consistency and speed
+    audio_resampled = soxr.resample(
+        audio_waveform, cfg["entrypoint"]["SAMPLE_RATE"], sample_rate, quality='hq'
     )
 
     for index, vad in enumerate(tqdm.tqdm(vad_list, desc="DNSMOS")):
@@ -411,13 +464,8 @@ if __name__ == "__main__":
 
     logger.debug(" * Loading ASR Model")
     asr_model = whisper_asr.load_asr_model(
-        args.whisper_arch,
-        device_name,
-        compute_type=args.compute_type,
-        threads=args.threads,
-        asr_options={
-            "initial_prompt": "Um, Uh, Ah. Like, you know. I mean, right. Actually. Basically, and right? okay. Alright. Emm. So. Oh. 生于忧患,死于安乐。岂不快哉?当然,嗯,呃,就,这样,那个,哪个,啊,呀,哎呀,哎哟,唉哇,啧,唷,哟,噫!微斯人,吾谁与归?ええと、あの、ま、そう、ええ。äh, hm, so, tja, halt, eigentlich. euh, quoi, bah, ben, tu vois, tu sais, t'sais, eh bien, du coup. genre, comme, style. 응,어,그,음."
-        },
+        args.whisper_arch, device_name, compute_type=args.compute_type, threads=args.threads,
+        asr_options={"initial_prompt": "Um, Uh, Ah. Like, you know. I mean, right. Actually. Basically, and right? okay. Alright. Emm. So. Oh. 生于忧患,死于安乐。岂不快哉?当然,嗯,呃,就,这样,那个,哪个,啊,呀,哎呀,哎哟,唉哇,啧,唷,哟,噫!微斯人,吾谁与归?ええと、あの、ま、そう、ええ。äh, hm, so, tja, halt, eigentlich. euh, quoi, bah, ben, tu vois, tu sais, t'sais, eh bien, du coup. genre, comme, style. 응,어,그,음."}
     )
 
     logger.debug(" * Loading VAD Model")
@@ -426,7 +474,7 @@ if __name__ == "__main__":
     logger.debug(" * Loading Background Noise Separation Model")
     separator_model = separate_fast.Predictor(args=cfg["separate"]["step1"], device=device_name)
 
-    logger.debug(" * Loading DNSMOS Model")
+    logger.debug(" * Loading DNSMOS Scoring Model")
     dnsmos_model = dnsmos.ComputeScore(cfg["mos_model"]["primary_model_path"], device_name)
     logger.debug("All models loaded")
 

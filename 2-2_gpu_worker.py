@@ -33,7 +33,6 @@ EMILIA_CONFIG_PATH = "Emilia/config.json"
 
 # --- Emilia Config ---
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 12))
-## REFACTOR: Define ASR model parameters here for the worker to use.
 WHISPER_ARCH = "medium"
 COMPUTE_TYPE = "float16"
 CPU_THREADS = 4
@@ -99,11 +98,6 @@ def complete_processing_task(s3_client, task_key):
             print(f"  Warning: Unexpected S3 error while completing task {task_key}: {e}")
             raise
 
-## REFACTOR: The run_emilia_pipe function is no longer needed because we are
-## calling the main_process function directly, avoiding the slow subprocess overhead.
-# def run_emilia_pipe(...):
-#     ...
-
 def processing_worker(rank: int, device: str):
     """
     A worker process that loads models once, then continuously claims and processes audio files.
@@ -161,9 +155,6 @@ def processing_worker(rank: int, device: str):
         "dnsmos": dnsmos_model,
     }
     print(f"GPU-{device} (Rank {rank}): All models loaded successfully.")
-    # --------------------------------------------------------------------------
-    # END OF MODEL LOADING BLOCK
-    # --------------------------------------------------------------------------
 
     while True:
         task = claim_processing_task(s3_client)
