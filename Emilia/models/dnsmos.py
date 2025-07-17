@@ -29,13 +29,15 @@ class ComputeScore:
     ComputeScore class for evaluating DNSMOS.
     """
 
-    def __init__(self, primary_model_path, device="cpu") -> None:
+    ## FIX: Added device_index to the constructor to allow for specific GPU assignment.
+    def __init__(self, primary_model_path, device="cpu", device_index=0) -> None:
         """
         Initialize the ComputeScore object.
 
         Args:
             primary_model_path (str): Path to the primary model.
             device (str): Device to run the models on ('cpu' or 'cuda').
+            device_index (int): The index of the GPU to use.
 
         Returns:
             None
@@ -44,12 +46,18 @@ class ComputeScore:
             RuntimeError: If the device is not supported.
         """
         if device == "cuda":
+            ## FIX: Explicitly tell the CUDAExecutionProvider which device ID to use.
+            provider_options = [{'device_id': str(device_index)}]
             self.onnx_sess = ort.InferenceSession(
-                primary_model_path, providers=["CUDAExecutionProvider"]
+                primary_model_path, 
+                providers=['CUDAExecutionProvider'],
+                provider_options=provider_options
             )
             print("Using CUDA:", self.onnx_sess.get_providers())
         else:
-            self.onnx_sess = ort.InferenceSession(primary_model_path)
+            self.onnx_sess = ort.InferenceSession(
+                primary_model_path, providers=["CPUExecutionProvider"]
+            )
 
     def audio_melspec(
         self, audio, n_mels=120, frame_size=320, hop_length=160, sr=16000, to_db=True
@@ -164,11 +172,11 @@ class ComputeScore:
             "len_in_sec": actual_audio_len / fs,
             "sr": fs,
             "num_hops": num_hops,
-            "OVRL_raw": np.mean(predicted_mos_ovr_seg_raw),
-            "SIG_raw": np.mean(predicted_mos_sig_seg_raw),
-            "BAK_raw": np.mean(predicted_mos_bak_seg_raw),
-            "OVRL": np.mean(predicted_mos_ovr_seg),
-            "SIG": np.mean(predicted_mos_sig_seg),
-            "BAK": np.mean(predicted_mos_bak_seg),
+            "OVRL_raw": np.mean(predicted_mos_ovr_seg_raw) if predicted_mos_ovr_seg_raw else 0,
+            "SIG_raw": np.mean(predicted_mos_sig_seg_raw) if predicted_mos_sig_seg_raw else 0,
+            "BAK_raw": np.mean(predicted_mos_bak_seg_raw) if predicted_mos_bak_seg_raw else 0,
+            "OVRL": np.mean(predicted_mos_ovr_seg) if predicted_mos_ovr_seg else 0,
+            "SIG": np.mean(predicted_mos_sig_seg) if predicted_mos_sig_seg else 0,
+            "BAK": np.mean(predicted_mos_bak_seg) if predicted_mos_bak_seg else 0,
         }
         return clip_dict

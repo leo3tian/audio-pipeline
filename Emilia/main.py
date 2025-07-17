@@ -19,11 +19,11 @@ import pandas as pd
 from typing import TypedDict
 import threading
 from queue import Queue
-## OPTIMIZATION: Import soxr for high-performance resampling
 import soxr
+## FIX: Changed from multiprocessing to ThreadPoolExecutor for this specific task
+from concurrent.futures import ThreadPoolExecutor
 
 from utils.tool import (
-    export_to_mp3,
     load_cfg,
     get_audio_files,
     detect_gpu,
@@ -48,10 +48,68 @@ logger = Logger.get_logger()
 logger.setLevel(logging.DEBUG)
 
 
+# --- OPTIMIZED I/O FUNCTIONS ---
+
+def _export_mp3_segment_thread(args):
+    """Helper function for ThreadPoolExecutor to export a single MP3."""
+    segment, audio_segment, save_path, audio_name = args
+    start_ms = int(segment["start"] * 1000)
+    end_ms = int(segment["end"] * 1000)
+    
+    # Extract the audio chunk
+    chunk = audio_segment[start_ms:end_ms]
+    
+    # Define the output filename
+    idx = segment.get("segment_id", 0) # Use a segment ID if available
+    output_filename = os.path.join(save_path, f"{audio_name}_{idx:06d}.mp3")
+    
+    # Export the chunk to MP3
+    try:
+        chunk.export(output_filename, format="mp3")
+    except Exception as e:
+        logger.error(f"Failed to export segment {idx} to {output_filename}: {e}")
+    return True
+
+@time_logger
+def export_to_mp3(audio, segments, save_path, audio_name):
+    """
+    Exports audio segments to MP3 files in parallel using a ThreadPoolExecutor.
+    """
+    if not segments:
+        logger.info("No segments to export.")
+        return
+
+    logger.info(f"Starting parallel export of {len(segments)} MP3 files...")
+    
+    # Convert numpy waveform to pydub AudioSegment once
+    waveform_int16 = (audio["waveform"] * 32767).astype(np.int16)
+    audio_segment = AudioSegment(
+        waveform_int16.tobytes(), 
+        frame_rate=audio["sample_rate"],
+        sample_width=waveform_int16.dtype.itemsize,
+        channels=1
+    )
+    
+    # Prepare arguments for each worker
+    tasks = []
+    for i, segment in enumerate(segments):
+        segment['segment_id'] = i # Add an index for unique filenames
+        tasks.append((segment, audio_segment, save_path, audio_name))
+
+    # For many small, fast tasks that involve I/O (writing to disk),
+    # a ThreadPoolExecutor is more efficient due to lower overhead.
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        list(tqdm.tqdm(executor.map(_export_mp3_segment_thread, tasks), total=len(tasks), desc="Exporting to MP3"))
+
+    logger.info("Parallel MP3 export complete.")
+
+
+# --- CORE PROCESSING FUNCTIONS ---
+
 @time_logger
 def standardization(audio, cfg):
     """
-    Preprocess the audio file, including setting sample rate, bit depth, channels, and volume normalization.
+    Preprocess the audio file.
     """
     global audio_count
     name = "audio"
@@ -93,37 +151,26 @@ def standardization(audio, cfg):
 @time_logger
 def source_separation(predictor, audio):
     """
-    Separate audio into vocals and non-vocals using a three-stage pipeline
-    to maximize GPU utilization.
+    Separate audio into vocals and non-vocals using a three-stage pipeline.
     """
-    ## OPTIMIZATION: Reduced chunk size for better pipeline flow and lower memory use.
     CHUNK_DURATION_SECONDS = 600 # 10 minutes
     TARGET_SR = 44100
     original_sr = audio["sample_rate"]
     original_waveform = audio["waveform"]
     chunk_size_frames_orig = CHUNK_DURATION_SECONDS * original_sr
     
-    # --- Pipeline Queues ---
-    # Queue for chunks resampled UP, ready for the GPU
     to_gpu_queue = Queue(maxsize=2)
-    # Queue for chunks predicted by the GPU, ready for final resampling DOWN
     from_gpu_queue = Queue(maxsize=2)
-
     final_vocals_chunks = []
     
-    # --- Stage 1: Producer Thread (CPU) ---
     def producer():
-        """Reads audio, resamples it UP to the target SR, and puts it in the to_gpu_queue."""
         for i in range(0, len(original_waveform), chunk_size_frames_orig):
             original_chunk = original_waveform[i:i + chunk_size_frames_orig]
             resampled_chunk = soxr.resample(original_chunk, original_sr, TARGET_SR, quality='hq')
             to_gpu_queue.put(resampled_chunk)
-        # Signal that production is finished
         to_gpu_queue.put(None)
 
-    # --- Stage 3: Post-Processor Thread (CPU) ---
     def post_processor():
-        """Takes predicted chunks from from_gpu_queue, resamples them DOWN, and appends to the final list."""
         while True:
             predicted_chunk = from_gpu_queue.get()
             if predicted_chunk is None:
@@ -131,37 +178,25 @@ def source_separation(predictor, audio):
             vocals_chunk_original_sr = soxr.resample(predicted_chunk[:, 0], TARGET_SR, original_sr, quality='hq')
             final_vocals_chunks.append(vocals_chunk_original_sr)
 
-    # --- Start background threads ---
     producer_thread = threading.Thread(target=producer)
     post_processor_thread = threading.Thread(target=post_processor)
     producer_thread.start()
     post_processor_thread.start()
 
-    # --- Stage 2: Main Consumer Loop (GPU) ---
     num_chunks = (len(original_waveform) + chunk_size_frames_orig - 1) // chunk_size_frames_orig
     logger.info(f"Fully optimized source separation started for {num_chunks} chunks...")
     
     for _ in tqdm.tqdm(range(num_chunks), desc="Separating Chunks"):
-        # 1. Get a chunk that's ready for the GPU
         resampled_chunk = to_gpu_queue.get()
         if resampled_chunk is None:
             break
-        
-        # 2. Run the GPU prediction
         vocals_chunk_resampled, _ = predictor.predict(resampled_chunk)
-        
-        # 3. Pass the result to the post-processor
         from_gpu_queue.put(vocals_chunk_resampled)
 
-    # --- Cleanup ---
-    # Signal the post-processor to finish
     from_gpu_queue.put(None)
-    
-    # Wait for both background threads to complete their work
     producer_thread.join()
     post_processor_thread.join()
 
-    # --- Final Assembly ---
     final_vocals = np.concatenate(final_vocals_chunks)
     audio["waveform"] = final_vocals
     logger.info("Source separation complete.")
@@ -260,10 +295,9 @@ def asr(vad_segments, audio, asr_model, batch_size, cfg):
     temp_audio = temp_audio[start_frame:end_frame]
 
     for idx, segment in enumerate(vad_segments):
-        vad_segments[idx]["start"] -= start_time
-        vad_segments[idx]["end"] -= start_time
+        segment["start"] -= start_time
+        segment["end"] -= start_time
     
-    # Using soxr here as well for consistency and speed
     temp_audio = soxr.resample(
         temp_audio, audio["sample_rate"], 16000, quality='hq'
     )
@@ -323,7 +357,6 @@ def mos_prediction(audio, vad_list, dnsmos_model, cfg):
     audio_waveform = audio["waveform"]
     sample_rate = 16000
 
-    # Using soxr here as well for consistency and speed
     audio_resampled = soxr.resample(
         audio_waveform, cfg["entrypoint"]["SAMPLE_RATE"], sample_rate, quality='hq'
     )
@@ -465,7 +498,7 @@ if __name__ == "__main__":
     logger.debug(" * Loading ASR Model")
     asr_model = whisper_asr.load_asr_model(
         args.whisper_arch, device_name, compute_type=args.compute_type, threads=args.threads,
-        asr_options={"initial_prompt": "Um, Uh, Ah. Like, you know. I mean, right. Actually. Basically, and right? okay. Alright. Emm. So. Oh. 生于忧患,死于安乐。岂不快哉?当然,嗯,呃,就,这样,那个,哪个,啊,呀,哎呀,哎哟,唉哇,啧,唷,哟,噫!微斯人,吾谁与归?ええと、あの、ま、そう、ええ。äh, hm, so, tja, halt, eigentlich. euh, quoi, bah, ben, tu vois, tu sais, t'sais, eh bien, du coup. genre, comme, style. 응,어,그,음."}
+        asr_options=cfg.get("asr")
     )
 
     logger.debug(" * Loading VAD Model")
