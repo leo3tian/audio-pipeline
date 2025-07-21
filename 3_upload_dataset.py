@@ -66,7 +66,8 @@ def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_nu
                     base_filename = record['audio'].replace('.mp3', '')
                     json_filepath = batch_content_path / f"{base_filename}.json"
                     with open(json_filepath, 'w', encoding='utf-8', errors='replace') as f:
-                        json.dump(record, f, ensure_ascii=False, indent=2, errors='replace')
+                        # Remove the errors parameter from json.dump
+                        json.dump(record, f, ensure_ascii=False, indent=2)
 
                 except Exception as e:
                     print(f"  [!] Failed to download or process file for record {record.get('id', 'N/A')}. Error: {e}")
