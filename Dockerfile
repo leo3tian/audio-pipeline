@@ -28,14 +28,15 @@ WORKDIR /workspace
 # Copy requirements and install all conda envs
 COPY requirements.txt .
 COPY Emilia/env.sh Emilia/env.sh
-RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y
+#RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
+#    /opt/conda/bin/conda run -n AudioPipeline pip install -r requirements.txt && \
 #    /opt/conda/bin/conda run -n AudioPipeline bash -c "cd Emilia && bash env.sh"
 
-RUN /opt/conda/bin/conda install ffmpeg -y
-
-RUN /opt/conda/bin/conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia -y
-
-RUN /opt/conda/bin/conda run -n AudioPipeline pip install -r requirements.txt
+RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
+    /opt/conda/envs/AudioPipeline/bin/conda install -n AudioPipeline ffmpeg -y && \
+    /opt/conda/envs/AudioPipeline/bin/conda install -n AudioPipeline \
+        pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia -y && \
+    /opt/conda/envs/AudioPipeline/bin/pip install -r requirements.txt
 
 
 COPY . .

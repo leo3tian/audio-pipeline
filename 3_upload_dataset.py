@@ -8,23 +8,31 @@ from botocore.exceptions import ClientError
 import tempfile
 import tarfile
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
 S3_PROCESSED_PREFIX = "processed/"
-HF_REPO_ID = os.environ.get("HF_REPO_ID", "fixie-ai/joe_rogan_youtube")
+HF_REPO_ID = os.environ.get("HF_REPO_ID", "your-hf-username/your-dataset-name")
 HF_TOKEN = os.environ.get("HF_TOKEN")
-FILES_PER_TAR_BATCH = 5000 
+# How many audio/json pairs go into each .tar archive
+FILES_PER_TAR_BATCH = 5000
+# Number of parallel download threads
+DOWNLOAD_WORKERS = 32
+
+def download_file(s3_client, s3_key, local_path):
+    """Helper function to download a single file for the thread pool."""
+    s3_client.download_file(S3_BUCKET_NAME, s3_key, str(local_path))
 
 def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_num: int):
     """
-    Downloads a batch of audio files, creates a parallel batch of individual JSON files,
-    and uploads them together in a single .tar archive to replicate the Emilia dataset structure.
+    Downloads a batch of audio files in parallel, creates corresponding JSON files,
+    archives them, and uploads the batch to Hugging Face.
     """
     batch_name = f"batch_{batch_num:05d}.tar"
     hf_tar_path = f"archives/{batch_name}"
     
-    # Check if this batch already exists on the Hub to make this resumable
+    # Resumability: Check if this batch already exists on the Hub
     if api.file_exists(repo_id=HF_REPO_ID, repo_type="dataset", filename=hf_tar_path):
         print(f"  Batch {batch_name} already exists on Hugging Face Hub. Skipping.")
         return
@@ -32,30 +40,40 @@ def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_nu
     print(f"\nProcessing batch #{batch_num} with {len(batch_records)} files...")
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
-        
-        # Create a single directory for both audio and json files
         batch_content_path = temp_path / "batch_content"
         os.makedirs(batch_content_path)
 
-        # Step 1: Download audio files and create individual JSON files in the same directory
-        for record in tqdm.tqdm(batch_records, desc=f"Preparing batch #{batch_num}"):
-            s3_key = record.pop("_s3_key") # Remove the temporary S3 key
-            base_filename = os.path.basename(s3_key).replace('.mp3', '')
+        # Step 1: Download audio files in parallel and create individual JSON files
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+            future_to_record = {
+                executor.submit(
+                    download_file, 
+                    s3_client, 
+                    record["_s3_key"], 
+                    batch_content_path / os.path.basename(record["_s3_key"])
+                ): record
+                for record in batch_records
+            }
 
-            # Download the audio file
-            s3_client.download_file(S3_BUCKET_NAME, s3_key, str(batch_content_path / f"{base_filename}.mp3"))
+            for future in tqdm.tqdm(as_completed(future_to_record), total=len(batch_records), desc=f"Downloading batch #{batch_num}"):
+                record = future_to_record[future]
+                try:
+                    future.result() # Check for download errors
+                    
+                    # Pop the temporary S3 key and create the JSON file
+                    record.pop("_s3_key")
+                    base_filename = record['audio'].replace('.mp3', '') # audio is now just 'video_id_000001.mp3'
+                    json_filepath = batch_content_path / f"{base_filename}.json"
+                    with open(json_filepath, 'w', encoding='utf-8') as f:
+                        json.dump(record, f, ensure_ascii=False, indent=2)
 
-            # Create the corresponding JSON file
-            json_filepath = batch_content_path / f"{base_filename}.json"
-            with open(json_filepath, 'w', encoding='utf-8') as f:
-                # The record now contains all metadata for this single segment
-                json.dump(record, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    print(f"  [!] Failed to download or process file for record {record.get('id', 'N/A')}. Error: {e}")
 
         # Step 2: Create a single .tar archive containing both file types
         tar_filepath = temp_path / batch_name
         print(f"  Creating mixed-content archive: {tar_filepath}")
         with tarfile.open(tar_filepath, "w") as tar:
-            # Add the contents of the directory to the root of the tar file
             tar.add(str(batch_content_path), arcname=".")
         
         # Step 3: Upload the single .tar file to Hugging Face
@@ -70,8 +88,8 @@ def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_nu
 
 def finalize_and_upload():
     """
-    Scans S3, aggregates metadata, and creates batched .tar archives containing
-    both audio and individual JSON files, then uploads to Hugging Face.
+    Scans S3, aggregates metadata, and creates/uploads batched .tar archives
+    containing both audio and individual JSON files to Hugging Face.
     """
     s3_client = boto3.client('s3')
     api = HfApi(token=HF_TOKEN)
@@ -95,11 +113,15 @@ def finalize_and_upload():
             for i, segment in enumerate(segments):
                 base_filename = f"{video_id}_{i:06d}"
                 s3_audio_key = os.path.join(s3_video_prefix, f"{base_filename}.mp3")
-                # The audio path is now relative to its corresponding JSON file
+                
+                # This record will be written to the individual JSON file
                 all_metadata.append({
-                    "audio": f"{base_filename}.mp3", "text": segment.get("text", ""),
-                    "speaker_id": segment.get("speaker", "UNKNOWN"), "duration": segment.get("end", 0) - segment.get("start", 0),
-                    "dnsmos": segment.get("dnsmos", 0.0), "language": segment.get("language", "UNKNOWN"),
+                    "audio": f"{base_filename}.mp3", 
+                    "text": segment.get("text", ""),
+                    "speaker_id": segment.get("speaker", "UNKNOWN"), 
+                    "duration": segment.get("end", 0) - segment.get("start", 0),
+                    "dnsmos": segment.get("dnsmos", 0.0), 
+                    "language": segment.get("language", "UNKNOWN"),
                     "_s3_key": s3_audio_key # Temporary key for downloading
                 })
         except ClientError as e:
