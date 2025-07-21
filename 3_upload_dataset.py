@@ -26,7 +26,16 @@ PREFIXES_PER_BATCH = 1000  # Process S3 listing in batches
 
 def download_file(s3_client, s3_key, local_path):
     """Helper function to download a single file for the thread pool."""
-    s3_client.download_file(S3_BUCKET_NAME, s3_key, str(local_path))
+    try:
+        # First check if the file exists
+        s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        # If we get here, the file exists, so download it
+        s3_client.download_file(S3_BUCKET_NAME, s3_key, str(local_path))
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return False
+        raise
 
 def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_num: int):
     """
@@ -46,6 +55,8 @@ def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_nu
         batch_content_path = temp_path / "batch_content"
         os.makedirs(batch_content_path)
 
+        valid_records = []  # Keep track of records with successfully downloaded audio
+        
         with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
             future_to_record = {
                 executor.submit(
@@ -60,20 +71,30 @@ def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_nu
             for future in tqdm.tqdm(as_completed(future_to_record), total=len(batch_records), desc=f"Downloading batch #{batch_num}"):
                 record = future_to_record[future]
                 try:
-                    future.result()
+                    download_success = future.result()
+                    if not download_success:
+                        print(f"  [!] Audio file not found in S3: {record['_s3_key']}")
+                        continue
                     
-                    record.pop("_s3_key")
-                    base_filename = record['audio'].replace('.mp3', '')
+                    # If download was successful, create the JSON file
+                    record_copy = record.copy()
+                    record_copy.pop("_s3_key")
+                    base_filename = record_copy['audio'].replace('.mp3', '')
                     json_filepath = batch_content_path / f"{base_filename}.json"
                     with open(json_filepath, 'w', encoding='utf-8', errors='replace') as f:
-                        # Remove the errors parameter from json.dump
-                        json.dump(record, f, ensure_ascii=False, indent=2)
+                        json.dump(record_copy, f, ensure_ascii=False, indent=2)
+                    
+                    valid_records.append(record)
 
                 except Exception as e:
-                    print(f"  [!] Failed to download or process file for record {record.get('id', 'N/A')}. Error: {e}")
+                    print(f"  [!] Failed to process record {record.get('audio', 'N/A')}: {str(e)[:200]}")
 
+        if not valid_records:
+            print(f"  [!] No valid files in batch {batch_num}, skipping tar creation")
+            return
+
+        print(f"  Creating archive with {len(valid_records)} valid files out of {len(batch_records)} total")
         tar_filepath = temp_path / batch_name
-        print(f"  Creating mixed-content archive: {tar_filepath}")
         with tarfile.open(tar_filepath, "w") as tar:
             tar.add(str(batch_content_path), arcname=".")
         
@@ -84,7 +105,7 @@ def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_nu
             repo_id=HF_REPO_ID,
             repo_type="dataset"
         )
-        print(f"  ✅ Successfully uploaded {batch_name}.")
+        print(f"  ✅ Successfully uploaded {batch_name}")
 
 def list_prefixes_generator(s3_client) -> Iterator[str]:
     """Generator that yields prefixes in batches to avoid memory issues."""
@@ -109,7 +130,6 @@ def process_metadata_batch(metadata_queue: queue.Queue, output_file, counter: Di
             try:
                 metadata_s3_key = os.path.join(prefix, "all_segments.json")
                 response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=metadata_s3_key)
-                # Explicitly decode the S3 response as UTF-8
                 content = response['Body'].read().decode('utf-8', errors='replace')
                 segments = json.loads(content)
                 
@@ -128,11 +148,16 @@ def process_metadata_batch(metadata_queue: queue.Queue, output_file, counter: Di
                         "_s3_key": s3_audio_key
                     }
                     
-                    # Remove errors parameter from json.dumps
-                    line = json.dumps(record, ensure_ascii=False) + '\n'
-                    output_file.write(line)
-                    with counter['lock']:
-                        counter['total'] += 1
+                    try:
+                        # First verify we can serialize it
+                        json_str = json.dumps(record, ensure_ascii=False)
+                        # Only write if serialization succeeded
+                        output_file.write(json_str + '\n')
+                        with counter['lock']:
+                            counter['total'] += 1
+                    except Exception as e:
+                        print(f"  [!] Failed to serialize record for {base_filename}: {e}")
+                        continue
                         
             except ClientError as e:
                 if e.response['Error']['Code'] != 'NoSuchKey':
@@ -195,20 +220,37 @@ def finalize_and_upload():
         # Process and upload in batches
         with open(master_metadata_path, 'r', encoding='utf-8', errors='replace') as f_meta:
             for i in range(num_batches):
-                batch_lines = list(itertools.islice(f_meta, FILES_PER_TAR_BATCH))
-                if not batch_lines: break
+                batch_lines = []
+                # Read lines and filter out empty ones
+                for _ in range(FILES_PER_TAR_BATCH):
+                    line = f_meta.readline()
+                    if not line:  # EOF
+                        break
+                    line = line.strip()
+                    if line:  # Only keep non-empty lines
+                        batch_lines.append(line)
+                
+                if not batch_lines:
+                    break
                 
                 batch_records = []
                 for line in batch_lines:
                     try:
-                        record = json.loads(line.strip())
-                        batch_records.append(record)
+                        record = json.loads(line)
+                        if isinstance(record, dict) and all(k in record for k in ['audio', '_s3_key']):
+                            batch_records.append(record)
+                        else:
+                            print(f"  [!] Skipping record with missing required fields")
                     except json.JSONDecodeError as e:
-                        print(f"  [!] Skipping malformed JSON line: {e}")
+                        print(f"  [!] Skipping malformed JSON line: {str(e)[:100]}")  # Limit error length
                         continue
                 
                 if batch_records:  # Only process if we have valid records
+                    print(f"  Processing batch {i} with {len(batch_records)} valid records "
+                          f"(skipped {len(batch_lines) - len(batch_records)} invalid records)")
                     create_and_upload_batch(api, s3_client, batch_records, i)
+                else:
+                    print(f"  [!] Batch {i} had no valid records to process")
         
         print("\n✨ Upload complete!")
         print(f"Check your dataset at: https://huggingface.co/datasets/{HF_REPO_ID}")
