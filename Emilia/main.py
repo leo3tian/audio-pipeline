@@ -10,6 +10,25 @@ import numpy as np
 import sys
 import os
 import tqdm
+
+# Define a mock class that safely mimics tqdm's behavior but does nothing.
+class _TqdmMock:
+    """A mock class to replace tqdm and suppress all output."""
+    def __init__(self, iterable=None, *args, **kwargs):
+        self.iterable = iterable
+
+    def __iter__(self):
+        # Allow the object to be used in for loops
+        return iter(self.iterable if self.iterable is not None else [])
+
+    # This is the key: a catch-all for any method calls
+    def __getattr__(self, *args, **kwargs):
+        """Catch any method call (.set_description, .update, etc.) and do nothing."""
+        return lambda *args, **kwargs: None
+
+# Replace the real tqdm with our silent mock class
+tqdm.tqdm = _TqdmMock
+
 import warnings
 import logging
 import torch
@@ -45,7 +64,7 @@ class ModelPack(TypedDict):
 
 # The logger is initialized globally so it can be accessed by all functions.
 logger = Logger.get_logger()
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARNING)
 
 
 # --- OPTIMIZED I/O FUNCTIONS ---

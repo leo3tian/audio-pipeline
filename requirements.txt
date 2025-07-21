@@ -1,18 +1,22 @@
-# Main project dependencies
-boto3
-tqdm
+onnxruntime-gpu
+
+yt-dlp
 huggingface_hub
 datasets
+boto3
 soundfile
-yt-dlp
 
-# Dependencies from Emilia/requirements.txt
+
 librosa
 numpy
+tqdm
 pydub
 pyannote.audio
 pandas
-git+https://github.com/m-bain/whisperx.git
+typing
+soxr
+git+https://github.com/m-bain/whisperx.git # needs torch >= 2.0.0
+faster_whisper
+whisperx
 
-# Dependency from env.sh
-onnxruntime-gpu
+

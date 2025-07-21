@@ -22,7 +22,7 @@ S3_RAW_AUDIO_PREFIX = "raw-audio/"
 S3_PROCESSED_PREFIX = "processed/"
 S3_TASKS_BASE_PREFIX = "tasks/"
 EMILIA_CONFIG_PATH = "Emilia/config.json"
-WORKERS_PER_GPU = int(os.environ.get("WORKERS_PER_GPU", 2))
+WORKERS_PER_GPU = int(os.environ.get("WORKERS_PER_GPU", 1))
 MAX_GPUS = int(os.environ.get("MAX_GPUS", 999))
 
 # --- Emilia Config ---
@@ -81,27 +81,22 @@ def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str
     s3_client = boto3.client("s3")
     files_to_upload = [f for f in local_directory.rglob("*") if f.is_file()]
     if not files_to_upload:
-        print("  No files to upload.")
         return
     print(f"  Starting parallel upload of {len(files_to_upload)} files to s3://{s3_bucket}/{s3_prefix}")
     def _upload_file(local_file_path):
         s3_key = f"{s3_prefix}/{local_file_path.relative_to(local_directory)}"
         try:
             s3_client.upload_file(str(local_file_path), s3_bucket, s3_key)
-            return True
         except Exception as e:
             print(f"  [!] Failed to upload {local_file_path}: {e}")
-            return False
     with ThreadPoolExecutor(max_workers=50) as executor:
         list(tqdm.tqdm(executor.map(_upload_file, files_to_upload), total=len(files_to_upload), desc="Uploading to S3"))
 
 def processing_worker(rank: int, assigned_gpu_id: str):
     """
-    A worker process that loads models once, then continuously claims and processes audio files.
-    This function is self-contained with its imports to ensure proper GPU isolation.
+    The main worker function. It's now called by a launcher to ensure GPU isolation.
     """
-    os.environ["CUDA_VISIBLE_DEVICES"] = assigned_gpu_id
-    
+    # Imports are now inside the function to ensure they happen *after* the environment is set.
     import torch
     from pyannote.audio import Pipeline
     
@@ -113,7 +108,8 @@ def processing_worker(rank: int, assigned_gpu_id: str):
     from models import separate_fast, dnsmos, whisper_asr, silero_vad
     from utils.tool import load_cfg
 
-    device_id_for_process = 0
+    # Since CUDA_VISIBLE_DEVICES is set, "cuda:0" will now correctly refer to the assigned GPU
+    device_id_for_process = 0 
     
     s3_client = boto3.client('s3')
     print(f"Worker-{rank} on Physical-GPU-{assigned_gpu_id}: Starting...")
@@ -137,14 +133,11 @@ def processing_worker(rank: int, assigned_gpu_id: str):
         print(f"Worker-{rank} on Physical-GPU-{assigned_gpu_id}: ASR model loaded for language: {ASR_LANGUAGE}")
 
     vad_model = silero_vad.SileroVAD(device=torch_device)
-    
-    ## FIX: Pass the correct device_index to the ONNX model loaders
     separator_model = separate_fast.Predictor(
         args=cfg["separate"]["step1"], 
         device=generic_cuda_device, 
         device_index=device_id_for_process
     )
-    # IMPORTANT: You must apply the same fix to your dnsmos.py file for this to work.
     dnsmos_model = dnsmos.ComputeScore(
         cfg["mos_model"]["primary_model_path"], 
         device=generic_cuda_device,
@@ -160,44 +153,30 @@ def processing_worker(rank: int, assigned_gpu_id: str):
     while True:
         task = claim_processing_task(s3_client)
         if not task:
-            print(f"Worker-{rank} on Physical-GPU-{assigned_gpu_id}: No more tasks found. Exiting.")
             break
-
         video_id = task['video_id']
         print(f"Worker-{rank} on Physical-GPU-{assigned_gpu_id}: Claimed task for video: {video_id}")
-
         try:
             with tempfile.TemporaryDirectory(prefix=f"gpu_worker_{assigned_gpu_id}_{rank}_") as temp_dir:
                 s3_search_prefix = f"{S3_RAW_AUDIO_PREFIX}{video_id}"
-                print(f"  Worker-{rank}: Searching for audio file with prefix '{s3_search_prefix}'...")
-                
                 response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_search_prefix, MaxKeys=1)
                 if 'Contents' not in response or not response['Contents']:
                     raise FileNotFoundError(f"Could not find any audio file for video_id: {video_id}")
-
                 s3_audio_key = response['Contents'][0]['Key']
                 local_filename = os.path.basename(s3_audio_key)
                 local_audio_path = Path(temp_dir) / local_filename
-                print(f"  Worker-{rank}: Found and downloading {s3_audio_key}...")
                 s3_client.download_file(S3_BUCKET, s3_audio_key, str(local_audio_path))
-
                 emilia_output_dir = Path(temp_dir) / "processed"
                 os.makedirs(emilia_output_dir, exist_ok=True)
-                print(f"  Worker-{rank}: Starting Emilia pipe for {video_id}...")
-                
                 main_process(
                     audio_path=str(local_audio_path), models=models, cfg=cfg,
                     device=torch_device, batch_size=BATCH_SIZE,
                     save_path=str(emilia_output_dir), audio_name=video_id
                 )
-
                 s3_processed_prefix = f"{S3_PROCESSED_PREFIX}{video_id}"
-                print(f"  Worker-{rank}: Uploading processed results for {video_id}...")
                 upload_directory_to_s3(emilia_output_dir, S3_BUCKET, s3_processed_prefix)
-            
             complete_processing_task(s3_client, task['key'])
             print(f"  Worker-{rank} on Physical-GPU-{assigned_gpu_id}: ✅ Finished and completed task for video: {video_id}")
-
         except Exception as e:
             print(f"  Worker-{rank} on Physical-GPU-{assigned_gpu_id}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
             time.sleep(10)
@@ -209,6 +188,12 @@ def get_available_gpus() -> list:
         return [line.strip() for line in output.decode("utf-8").splitlines()]
     except Exception:
         return []
+
+## FIX: This new launcher function ensures the environment is set *before* any other code runs.
+def worker_launcher(rank: int, assigned_gpu_id: str):
+    """Sets the environment for a worker and then calls the main worker function."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = assigned_gpu_id
+    processing_worker(rank, assigned_gpu_id)
 
 def main():
     """Orchestrates the pool of GPU worker processes."""
@@ -226,7 +211,8 @@ def main():
     print(f"🚀 Starting {total_workers} worker processes across {len(available_gpus)} GPUs ({WORKERS_PER_GPU} workers per GPU)...")
     
     for rank, device_id in enumerate(worker_assignments):
-        p = multiprocessing.Process(target=processing_worker, args=(rank, device_id))
+        # FIX: Call the new launcher function instead of the worker directly.
+        p = multiprocessing.Process(target=worker_launcher, args=(rank, device_id))
         p.start()
         processes.append(p)
 
