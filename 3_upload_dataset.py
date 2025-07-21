@@ -9,7 +9,7 @@ import tempfile
 import tarfile
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import itertools # Import the itertools module
+import itertools
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
@@ -18,6 +18,7 @@ HF_REPO_ID = os.environ.get("HF_REPO_ID", "your-hf-username/your-dataset-name")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 FILES_PER_TAR_BATCH = 5000
 DOWNLOAD_WORKERS = 32
+METADATA_SCAN_WORKERS = 64 # Number of threads for scanning S3 metadata
 
 def download_file(s3_client, s3_key, local_path):
     """Helper function to download a single file for the thread pool."""
@@ -80,10 +81,43 @@ def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_nu
         )
         print(f"  ✅ Successfully uploaded {batch_name}.")
 
+def fetch_and_parse_metadata(s3_video_prefix: str):
+    """
+    Fetches and parses the all_segments.json for a single video prefix.
+    This function is designed to be run in a thread pool.
+    """
+    s3_client = boto3.client('s3') # Each thread gets its own client
+    video_id = s3_video_prefix.rstrip('/').split('/')[-1]
+    metadata_s3_key = os.path.join(s3_video_prefix, "all_segments.json")
+    
+    records = []
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=metadata_s3_key)
+        segments = json.loads(response['Body'].read().decode('utf-8'))
+        for i, segment in enumerate(segments):
+            base_filename = f"{video_id}_{i:06d}"
+            s3_audio_key = os.path.join(s3_video_prefix, f"{base_filename}.mp3")
+            
+            records.append({
+                "audio": f"{base_filename}.mp3", "text": segment.get("text", ""),"speaker_id": segment.get("speaker", "UNKNOWN"), "duration": segment.get("end", 0) - segment.get("start", 0),"dnsmos": segment.get("dnsmos", 0.0), "language": segment.get("language", "UNKNOWN"),
+                "_s3_key": s3_audio_key
+            })
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return [] # Return an empty list if the metadata file is missing
+        else:
+            print(f"  [!] S3 error fetching {metadata_s3_key}: {e}")
+            return []
+    except json.JSONDecodeError:
+        print(f"  [!] Corrupted JSON file found at {metadata_s3_key}. Skipping.")
+        return []
+    return records
+
+
 def finalize_and_upload():
     """
-    Scans S3, streams metadata to a local file to handle large datasets, 
-    and then creates/uploads batched .tar archives to Hugging Face.
+    Scans S3, streams metadata to a local file in parallel, and then
+    creates/uploads batched .tar archives to Hugging Face.
     """
     s3_client = boto3.client('s3')
     api = HfApi(token=HF_TOKEN)
@@ -95,31 +129,24 @@ def finalize_and_upload():
         master_metadata_path = Path(temp_dir) / "master_metadata.jsonl"
         total_segments = 0
 
-        print("📝 Aggregating all metadata from S3 to local disk...")
+        print("📝 Aggregating all metadata from S3 to local disk (in parallel)...")
+        paginator = s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=S3_BUCKET_NAME, Prefix=S3_PROCESSED_PREFIX, Delimiter='/')
+        video_prefixes = [p['Prefix'] for p in pages.search('CommonPrefixes') if p]
+        
         with open(master_metadata_path, 'w', encoding='utf-8') as f_meta:
-            paginator = s3_client.get_paginator('list_objects_v2')
-            pages = paginator.paginate(Bucket=S3_BUCKET_NAME, Prefix=S3_PROCESSED_PREFIX, Delimiter='/')
-            video_prefixes = [p['Prefix'] for p in pages.search('CommonPrefixes') if p]
-            
-            for s3_video_prefix in tqdm.tqdm(video_prefixes, desc="Scanning metadata"):
-                video_id = s3_video_prefix.rstrip('/').split('/')[-1]
-                metadata_s3_key = os.path.join(s3_video_prefix, "all_segments.json")
-                try:
-                    response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=metadata_s3_key)
-                    segments = json.loads(response['Body'].read().decode('utf-8'))
-                    for i, segment in enumerate(segments):
-                        base_filename = f"{video_id}_{i:06d}"
-                        s3_audio_key = os.path.join(s3_video_prefix, f"{base_filename}.mp3")
-                        
-                        record = {
-                            "audio": f"{base_filename}.mp3", "text": segment.get("text", ""),"speaker_id": segment.get("speaker", "UNKNOWN"), "duration": segment.get("end", 0) - segment.get("start", 0),"dnsmos": segment.get("dnsmos", 0.0), "language": segment.get("language", "UNKNOWN"),
-                            "_s3_key": s3_audio_key
-                        }
-                        f_meta.write(json.dumps(record, ensure_ascii=False) + '\n')
-                        total_segments += 1
-                except ClientError as e:
-                    if e.response['Error']['Code'] == 'NoSuchKey': continue
-                    else: raise
+            with ThreadPoolExecutor(max_workers=METADATA_SCAN_WORKERS) as executor:
+                future_to_prefix = {executor.submit(fetch_and_parse_metadata, prefix): prefix for prefix in video_prefixes}
+                
+                for future in tqdm.tqdm(as_completed(future_to_prefix), total=len(video_prefixes), desc="Scanning metadata"):
+                    try:
+                        records = future.result()
+                        for record in records:
+                            f_meta.write(json.dumps(record, ensure_ascii=False) + '\n')
+                            total_segments += 1
+                    except Exception as e:
+                        prefix = future_to_prefix[future]
+                        print(f"  [!] A worker failed while processing prefix {prefix}. Error: {e}")
 
         if total_segments == 0:
             print("[!] No valid segments found to create a dataset.")
@@ -129,13 +156,10 @@ def finalize_and_upload():
         print(f"\nTotal segments to process: {total_segments}")
         print(f"Creating {num_batches} tar batches of up to {FILES_PER_TAR_BATCH} files each.")
 
-        # --- SCALABILITY FIX: Read the master file in chunks using itertools ---
         with open(master_metadata_path, 'r', encoding='utf-8') as f_meta:
             for i in range(num_batches):
-                # Use islice to safely grab a batch of lines from the file iterator
                 batch_lines = list(itertools.islice(f_meta, FILES_PER_TAR_BATCH))
-                if not batch_lines:
-                    break # Stop if there are no more lines to read
+                if not batch_lines: break
                 
                 batch_records = [json.loads(line) for line in batch_lines]
                 create_and_upload_batch(api, s3_client, batch_records, i)
