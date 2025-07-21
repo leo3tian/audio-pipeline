@@ -6,6 +6,7 @@ RUN apt-get update -qq && \
     apt-get install -y -qq \
     git wget ffmpeg curl build-essential bzip2 libsndfile1 python3 python3-pip unzip \
     libsox-dev screen vim && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip install boto3
@@ -36,7 +37,8 @@ RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
     /opt/conda/envs/AudioPipeline/bin/conda install -n AudioPipeline ffmpeg -y && \
     /opt/conda/envs/AudioPipeline/bin/conda install -n AudioPipeline \
         pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia -y && \
-    /opt/conda/envs/AudioPipeline/bin/pip install -r requirements.txt
+    /opt/conda/envs/AudioPipeline/bin/pip install -r requirements.txt && \
+    /opt/conda/bin/conda clean -a -y
 
 
 COPY . .
