@@ -149,14 +149,19 @@ def process_metadata_batch(metadata_queue: queue.Queue, output_file, counter: Di
                     }
                     
                     try:
-                        # First verify we can serialize it
+                        # Serialize to JSON string first
                         json_str = json.dumps(record, ensure_ascii=False)
-                        # Only write if serialization succeeded
+                        # Verify we can parse it back
+                        json.loads(json_str)  # Validation step
+                        # Write only if both steps succeed
                         output_file.write(json_str + '\n')
+                        output_file.flush()  # Force write to disk
                         with counter['lock']:
                             counter['total'] += 1
                     except Exception as e:
                         print(f"  [!] Failed to serialize record for {base_filename}: {e}")
+                        # Debug output to see the problematic record
+                        print(f"  [DEBUG] Problem record: {str(record)[:200]}")
                         continue
                         
             except ClientError as e:
@@ -221,14 +226,25 @@ def finalize_and_upload():
         with open(master_metadata_path, 'r', encoding='utf-8', errors='replace') as f_meta:
             for i in range(num_batches):
                 batch_lines = []
-                # Read lines and filter out empty ones
+                # Read and validate each line
                 for _ in range(FILES_PER_TAR_BATCH):
                     line = f_meta.readline()
                     if not line:  # EOF
                         break
                     line = line.strip()
-                    if line:  # Only keep non-empty lines
-                        batch_lines.append(line)
+                    if not line:  # Skip empty lines
+                        continue
+                    
+                    try:
+                        # Validate that this is a complete JSON object
+                        record = json.loads(line)
+                        if isinstance(record, dict) and all(k in record for k in ['audio', '_s3_key']):
+                            batch_lines.append(line)
+                        else:
+                            print(f"  [!] Invalid record structure: {str(line)[:50]}...")
+                    except json.JSONDecodeError as e:
+                        print(f"  [!] JSON error in line: {str(line)[:50]}... Error: {str(e)}")
+                        continue
                 
                 if not batch_lines:
                     break
@@ -237,15 +253,13 @@ def finalize_and_upload():
                 for line in batch_lines:
                     try:
                         record = json.loads(line)
-                        if isinstance(record, dict) and all(k in record for k in ['audio', '_s3_key']):
-                            batch_records.append(record)
-                        else:
-                            print(f"  [!] Skipping record with missing required fields")
+                        batch_records.append(record)
                     except json.JSONDecodeError as e:
-                        print(f"  [!] Skipping malformed JSON line: {str(e)[:100]}")  # Limit error length
+                        # This shouldn't happen since we validated above
+                        print(f"  [!] Unexpected JSON error: {e}")
                         continue
                 
-                if batch_records:  # Only process if we have valid records
+                if batch_records:
                     print(f"  Processing batch {i} with {len(batch_records)} valid records "
                           f"(skipped {len(batch_lines) - len(batch_records)} invalid records)")
                     create_and_upload_batch(api, s3_client, batch_records, i)
