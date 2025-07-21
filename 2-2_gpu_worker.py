@@ -96,7 +96,6 @@ def processing_worker(rank: int, assigned_gpu_id: str):
     """
     The main worker function. It's now called by a launcher to ensure GPU isolation.
     """
-    # Imports are now inside the function to ensure they happen *after* the environment is set.
     import torch
     from pyannote.audio import Pipeline
     
@@ -108,7 +107,6 @@ def processing_worker(rank: int, assigned_gpu_id: str):
     from models import separate_fast, dnsmos, whisper_asr, silero_vad
     from utils.tool import load_cfg
 
-    # Since CUDA_VISIBLE_DEVICES is set, "cuda:0" will now correctly refer to the assigned GPU
     device_id_for_process = 0 
     
     s3_client = boto3.client('s3')
@@ -175,11 +173,16 @@ def processing_worker(rank: int, assigned_gpu_id: str):
                 )
                 s3_processed_prefix = f"{S3_PROCESSED_PREFIX}{video_id}"
                 upload_directory_to_s3(emilia_output_dir, S3_BUCKET, s3_processed_prefix)
+            
             complete_processing_task(s3_client, task['key'])
             print(f"  Worker-{rank} on Physical-GPU-{assigned_gpu_id}: ✅ Finished and completed task for video: {video_id}")
+
         except Exception as e:
             print(f"  Worker-{rank} on Physical-GPU-{assigned_gpu_id}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
             time.sleep(10)
+        finally:
+            torch.cuda.empty_cache()
+
 
 def get_available_gpus() -> list:
     """Detects available NVIDIA GPU indices."""
@@ -189,7 +192,6 @@ def get_available_gpus() -> list:
     except Exception:
         return []
 
-## FIX: This new launcher function ensures the environment is set *before* any other code runs.
 def worker_launcher(rank: int, assigned_gpu_id: str):
     """Sets the environment for a worker and then calls the main worker function."""
     os.environ["CUDA_VISIBLE_DEVICES"] = assigned_gpu_id
@@ -211,7 +213,6 @@ def main():
     print(f"🚀 Starting {total_workers} worker processes across {len(available_gpus)} GPUs ({WORKERS_PER_GPU} workers per GPU)...")
     
     for rank, device_id in enumerate(worker_assignments):
-        # FIX: Call the new launcher function instead of the worker directly.
         p = multiprocessing.Process(target=worker_launcher, args=(rank, device_id))
         p.start()
         processes.append(p)

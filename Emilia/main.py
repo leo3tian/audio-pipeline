@@ -224,23 +224,27 @@ def source_separation(predictor, audio):
 
 @time_logger
 def speaker_diarization(audio, dia_pipeline, device):
-    """
-    Perform speaker diarization on the given audio.
-    """
+    """Perform speaker diarization."""
     logger.debug(f"Start speaker diarization")
-    waveform = torch.tensor(audio["waveform"]).to(device)
-    waveform = torch.unsqueeze(waveform, 0)
+    
+    ## MEMORY LEAK FIX: Create and destroy the tensor within this function's scope.
+    waveform_tensor = torch.from_numpy(audio["waveform"]).to(device)
+    if waveform_tensor.dim() == 1:
+        waveform_tensor = waveform_tensor.unsqueeze(0)
 
-    segments = dia_pipeline(
-        {"waveform": waveform, "sample_rate": audio["sample_rate"], "channel": 0}
-    )
+    segments = dia_pipeline({"waveform": waveform_tensor, "sample_rate": audio["sample_rate"]})
 
     diarize_df = pd.DataFrame(
         segments.itertracks(yield_label=True),
         columns=["segment", "label", "speaker"],
     )
-    diarize_df["start"] = diarize_df["segment"].apply(lambda x: x.start)
-    diarize_df["end"] = diarize_df["segment"].apply(lambda x: x.end)
+    if not diarize_df.empty:
+        diarize_df["start"] = diarize_df["segment"].apply(lambda x: x.start)
+        diarize_df["end"] = diarize_df["segment"].apply(lambda x: x.end)
+        
+    ## MEMORY LEAK FIX: Explicitly delete the large tensor to free VRAM.
+    del waveform_tensor
+    
     return diarize_df
 
 @time_logger
