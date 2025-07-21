@@ -99,46 +99,46 @@ def list_prefixes_generator(s3_client) -> Iterator[str]:
             if prefix:
                 yield prefix['Prefix']
 
-def process_metadata_batch(metadata_queue: queue.Queue, output_file, counter: Dict):
+def process_metadata_batch(metadata_queue: queue.Queue, output_file, counter: Dict, stop_event: threading.Event):
     """Process metadata files from the queue and write to output file."""
     s3_client = boto3.client('s3')
-    while True:
+    while not stop_event.is_set():  # Keep running until explicitly stopped
         try:
-            prefix = metadata_queue.get_nowait()
-        except queue.Empty:
-            break
-
-        try:
-            metadata_s3_key = os.path.join(prefix, "all_segments.json")
-            response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=metadata_s3_key)
-            segments = json.loads(response['Body'].read().decode('utf-8'))
-            
-            video_id = prefix.rstrip('/').split('/')[-1]
-            for i, segment in enumerate(segments):
-                base_filename = f"{video_id}_{i:06d}"
-                s3_audio_key = os.path.join(prefix, f"{base_filename}.mp3")
+            # Use a timeout to periodically check the stop_event
+            prefix = metadata_queue.get(timeout=1.0)
+            try:
+                metadata_s3_key = os.path.join(prefix, "all_segments.json")
+                response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=metadata_s3_key)
+                segments = json.loads(response['Body'].read().decode('utf-8'))
                 
-                record = {
-                    "audio": f"{base_filename}.mp3",
-                    "text": segment.get("text", ""),
-                    "speaker_id": segment.get("speaker", "UNKNOWN"),
-                    "duration": segment.get("end", 0) - segment.get("start", 0),
-                    "dnsmos": segment.get("dnsmos", 0.0),
-                    "language": segment.get("language", "UNKNOWN"),
-                    "_s3_key": s3_audio_key
-                }
-                
-                output_file.write(json.dumps(record, ensure_ascii=False) + '\n')
-                with counter['lock']:
-                    counter['total'] += 1
+                video_id = prefix.rstrip('/').split('/')[-1]
+                for i, segment in enumerate(segments):
+                    base_filename = f"{video_id}_{i:06d}"
+                    s3_audio_key = os.path.join(prefix, f"{base_filename}.mp3")
                     
-        except ClientError as e:
-            if e.response['Error']['Code'] != 'NoSuchKey':
-                print(f"  [!] S3 error fetching {prefix}: {e}")
-        except Exception as e:
-            print(f"  [!] Error processing {prefix}: {e}")
-        finally:
-            metadata_queue.task_done()
+                    record = {
+                        "audio": f"{base_filename}.mp3",
+                        "text": segment.get("text", ""),
+                        "speaker_id": segment.get("speaker", "UNKNOWN"),
+                        "duration": segment.get("end", 0) - segment.get("start", 0),
+                        "dnsmos": segment.get("dnsmos", 0.0),
+                        "language": segment.get("language", "UNKNOWN"),
+                        "_s3_key": s3_audio_key
+                    }
+                    
+                    output_file.write(json.dumps(record, ensure_ascii=False) + '\n')
+                    with counter['lock']:
+                        counter['total'] += 1
+                        
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'NoSuchKey':
+                    print(f"  [!] S3 error fetching {prefix}: {e}")
+            except Exception as e:
+                print(f"  [!] Error processing {prefix}: {e}")
+            finally:
+                metadata_queue.task_done()
+        except queue.Empty:
+            continue  # Keep trying if the queue is temporarily empty
 
 def finalize_and_upload():
     """Optimized version for handling massive datasets."""
@@ -151,6 +151,7 @@ def finalize_and_upload():
     with tempfile.TemporaryDirectory() as temp_dir:
         master_metadata_path = Path(temp_dir) / "master_metadata.jsonl"
         counter = {'total': 0, 'lock': threading.Lock()}
+        stop_event = threading.Event()  # Add this line
         
         print("📝 Processing metadata (with streaming)...")
         metadata_queue = queue.Queue(maxsize=PREFIXES_PER_BATCH * 2)
@@ -160,21 +161,27 @@ def finalize_and_upload():
             with ThreadPoolExecutor(max_workers=METADATA_SCAN_WORKERS) as executor:
                 # Start the worker threads
                 workers = [
-                    executor.submit(process_metadata_batch, metadata_queue, f_meta, counter)
+                    executor.submit(process_metadata_batch, metadata_queue, f_meta, counter, stop_event)
                     for _ in range(METADATA_SCAN_WORKERS)
                 ]
                 
-                # Feed the queue with prefixes
-                prefix_count = 0
-                for prefix in list_prefixes_generator(s3_client):
-                    metadata_queue.put(prefix)
-                    prefix_count += 1
-                    if prefix_count % 1000 == 0:
-                        print(f"  Listed {prefix_count} prefixes...")
-                
-                # Wait for all metadata processing to complete
-                metadata_queue.join()
-        
+                try:
+                    # Feed the queue with prefixes
+                    prefix_count = 0
+                    for prefix in list_prefixes_generator(s3_client):
+                        metadata_queue.put(prefix)
+                        prefix_count += 1
+                        if prefix_count % 1000 == 0:
+                            print(f"  Listed {prefix_count} prefixes...")
+                    
+                    # Signal workers we're done adding items
+                    metadata_queue.join()
+                finally:
+                    # Signal all workers to stop and wait for them
+                    stop_event.set()
+                    for worker in workers:
+                        worker.result()  # Wait for all workers to complete
+
         total_segments = counter['total']
         if total_segments == 0:
             print("[!] No valid segments found.")
