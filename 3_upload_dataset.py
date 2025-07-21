@@ -9,6 +9,7 @@ import tempfile
 import tarfile
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import itertools # Import the itertools module
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
@@ -94,7 +95,6 @@ def finalize_and_upload():
         master_metadata_path = Path(temp_dir) / "master_metadata.jsonl"
         total_segments = 0
 
-        # --- SCALABILITY FIX: Stream metadata to a local file on disk ---
         print("📝 Aggregating all metadata from S3 to local disk...")
         with open(master_metadata_path, 'w', encoding='utf-8') as f_meta:
             paginator = s3_client.get_paginator('list_objects_v2')
@@ -112,12 +112,7 @@ def finalize_and_upload():
                         s3_audio_key = os.path.join(s3_video_prefix, f"{base_filename}.mp3")
                         
                         record = {
-                            "audio": f"{base_filename}.mp3", 
-                            "text": segment.get("text", ""),
-                            "speaker_id": segment.get("speaker", "UNKNOWN"), 
-                            "duration": segment.get("end", 0) - segment.get("start", 0),
-                            "dnsmos": segment.get("dnsmos", 0.0), 
-                            "language": segment.get("language", "UNKNOWN"),
+                            "audio": f"{base_filename}.mp3", "text": segment.get("text", ""),"speaker_id": segment.get("speaker", "UNKNOWN"), "duration": segment.get("end", 0) - segment.get("start", 0),"dnsmos": segment.get("dnsmos", 0.0), "language": segment.get("language", "UNKNOWN"),
                             "_s3_key": s3_audio_key
                         }
                         f_meta.write(json.dumps(record, ensure_ascii=False) + '\n')
@@ -130,18 +125,19 @@ def finalize_and_upload():
             print("[!] No valid segments found to create a dataset.")
             return
 
-        # --- Now process batches by reading from the local master metadata file ---
         num_batches = math.ceil(total_segments / FILES_PER_TAR_BATCH)
         print(f"\nTotal segments to process: {total_segments}")
         print(f"Creating {num_batches} tar batches of up to {FILES_PER_TAR_BATCH} files each.")
 
+        # --- SCALABILITY FIX: Read the master file in chunks using itertools ---
         with open(master_metadata_path, 'r', encoding='utf-8') as f_meta:
             for i in range(num_batches):
-                # Read a batch of lines from the master file
-                batch_lines = [next(f_meta) for _ in range(FILES_PER_TAR_BATCH) if f_meta.tell() != os.fstat(f_meta.fileno()).st_size]
+                # Use islice to safely grab a batch of lines from the file iterator
+                batch_lines = list(itertools.islice(f_meta, FILES_PER_TAR_BATCH))
+                if not batch_lines:
+                    break # Stop if there are no more lines to read
+                
                 batch_records = [json.loads(line) for line in batch_lines]
-                if not batch_records:
-                    break
                 create_and_upload_batch(api, s3_client, batch_records, i)
         
         print("\n🎉🎉🎉 Dataset finalization and upload complete! 🎉🎉🎉")
