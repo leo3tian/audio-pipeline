@@ -127,8 +127,8 @@ def process_metadata_batch(metadata_queue: queue.Queue, output_file, counter: Di
                         "_s3_key": s3_audio_key
                     }
                     
-                    # Use ensure_ascii=False and handle encoding errors
-                    line = json.dumps(record, ensure_ascii=False, errors='replace') + '\n'
+                    # Remove errors parameter from json.dumps
+                    line = json.dumps(record, ensure_ascii=False) + '\n'
                     output_file.write(line)
                     with counter['lock']:
                         counter['total'] += 1
