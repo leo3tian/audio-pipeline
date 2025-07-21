@@ -65,8 +65,8 @@ def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_nu
                     record.pop("_s3_key")
                     base_filename = record['audio'].replace('.mp3', '')
                     json_filepath = batch_content_path / f"{base_filename}.json"
-                    with open(json_filepath, 'w', encoding='utf-8') as f:
-                        json.dump(record, f, ensure_ascii=False, indent=2)
+                    with open(json_filepath, 'w', encoding='utf-8', errors='replace') as f:
+                        json.dump(record, f, ensure_ascii=False, indent=2, errors='replace')
 
                 except Exception as e:
                     print(f"  [!] Failed to download or process file for record {record.get('id', 'N/A')}. Error: {e}")
@@ -102,14 +102,15 @@ def list_prefixes_generator(s3_client) -> Iterator[str]:
 def process_metadata_batch(metadata_queue: queue.Queue, output_file, counter: Dict, stop_event: threading.Event):
     """Process metadata files from the queue and write to output file."""
     s3_client = boto3.client('s3')
-    while not stop_event.is_set():  # Keep running until explicitly stopped
+    while not stop_event.is_set():
         try:
-            # Use a timeout to periodically check the stop_event
             prefix = metadata_queue.get(timeout=1.0)
             try:
                 metadata_s3_key = os.path.join(prefix, "all_segments.json")
                 response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=metadata_s3_key)
-                segments = json.loads(response['Body'].read().decode('utf-8'))
+                # Explicitly decode the S3 response as UTF-8
+                content = response['Body'].read().decode('utf-8', errors='replace')
+                segments = json.loads(content)
                 
                 video_id = prefix.rstrip('/').split('/')[-1]
                 for i, segment in enumerate(segments):
@@ -126,19 +127,23 @@ def process_metadata_batch(metadata_queue: queue.Queue, output_file, counter: Di
                         "_s3_key": s3_audio_key
                     }
                     
-                    output_file.write(json.dumps(record, ensure_ascii=False) + '\n')
+                    # Use ensure_ascii=False and handle encoding errors
+                    line = json.dumps(record, ensure_ascii=False, errors='replace') + '\n'
+                    output_file.write(line)
                     with counter['lock']:
                         counter['total'] += 1
                         
             except ClientError as e:
                 if e.response['Error']['Code'] != 'NoSuchKey':
                     print(f"  [!] S3 error fetching {prefix}: {e}")
+            except json.JSONDecodeError as e:
+                print(f"  [!] JSON decode error in {prefix}: {e}")
             except Exception as e:
                 print(f"  [!] Error processing {prefix}: {e}")
             finally:
                 metadata_queue.task_done()
         except queue.Empty:
-            continue  # Keep trying if the queue is temporarily empty
+            continue
 
 def finalize_and_upload():
     """Optimized version for handling massive datasets."""
@@ -151,22 +156,20 @@ def finalize_and_upload():
     with tempfile.TemporaryDirectory() as temp_dir:
         master_metadata_path = Path(temp_dir) / "master_metadata.jsonl"
         counter = {'total': 0, 'lock': threading.Lock()}
-        stop_event = threading.Event()  # Add this line
+        stop_event = threading.Event()
         
         print("📝 Processing metadata (with streaming)...")
         metadata_queue = queue.Queue(maxsize=PREFIXES_PER_BATCH * 2)
         
         # Start the metadata processing workers
-        with open(master_metadata_path, 'w', encoding='utf-8') as f_meta:
+        with open(master_metadata_path, 'w', encoding='utf-8', errors='replace') as f_meta:
             with ThreadPoolExecutor(max_workers=METADATA_SCAN_WORKERS) as executor:
-                # Start the worker threads
                 workers = [
                     executor.submit(process_metadata_batch, metadata_queue, f_meta, counter, stop_event)
                     for _ in range(METADATA_SCAN_WORKERS)
                 ]
                 
                 try:
-                    # Feed the queue with prefixes
                     prefix_count = 0
                     for prefix in list_prefixes_generator(s3_client):
                         metadata_queue.put(prefix)
@@ -174,13 +177,11 @@ def finalize_and_upload():
                         if prefix_count % 1000 == 0:
                             print(f"  Listed {prefix_count} prefixes...")
                     
-                    # Signal workers we're done adding items
                     metadata_queue.join()
                 finally:
-                    # Signal all workers to stop and wait for them
                     stop_event.set()
                     for worker in workers:
-                        worker.result()  # Wait for all workers to complete
+                        worker.result()
 
         total_segments = counter['total']
         if total_segments == 0:
@@ -191,13 +192,22 @@ def finalize_and_upload():
         num_batches = math.ceil(total_segments / FILES_PER_TAR_BATCH)
         
         # Process and upload in batches
-        with open(master_metadata_path, 'r', encoding='utf-8') as f_meta:
+        with open(master_metadata_path, 'r', encoding='utf-8', errors='replace') as f_meta:
             for i in range(num_batches):
                 batch_lines = list(itertools.islice(f_meta, FILES_PER_TAR_BATCH))
                 if not batch_lines: break
                 
-                batch_records = [json.loads(line) for line in batch_lines]
-                create_and_upload_batch(api, s3_client, batch_records, i)
+                batch_records = []
+                for line in batch_lines:
+                    try:
+                        record = json.loads(line.strip())
+                        batch_records.append(record)
+                    except json.JSONDecodeError as e:
+                        print(f"  [!] Skipping malformed JSON line: {e}")
+                        continue
+                
+                if batch_records:  # Only process if we have valid records
+                    create_and_upload_batch(api, s3_client, batch_records, i)
         
         print("\n✨ Upload complete!")
         print(f"Check your dataset at: https://huggingface.co/datasets/{HF_REPO_ID}")
