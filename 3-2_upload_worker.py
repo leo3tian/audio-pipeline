@@ -38,17 +38,18 @@ def get_s3_client():
     return thread_local_data.s3_client
 
 def download_file(local_path, s3_key):
-    """Helper function to download a single file. Uses a thread-local Boto3 client."""
+    """
+    Helper function to download a single file. Uses a thread-local Boto3 client
+    and an efficient "ask for forgiveness" pattern.
+    """
     s3_client = get_s3_client()
     try:
-        # First check if the file exists
-        s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
-        # If we get here, the file exists, so download it
+        # Attempt to download the file directly without a prior check.
         s3_client.download_file(S3_BUCKET_NAME, s3_key, str(local_path))
         return True
     except ClientError as e:
         if e.response['Error']['Code'] == '404':
-             # Try without leading zeros
+            # The file was not found with the primary key. Now try the alternative.
             path_parts = s3_key.rsplit('_', 1)
             if len(path_parts) == 2:
                 base_path, segment_part = path_parts
@@ -56,13 +57,16 @@ def download_file(local_path, s3_key):
                 if segment_num_str.startswith('0') and len(segment_num_str) > 1:
                     try:
                         alternative_key = f"{base_path}_{int(segment_num_str)}.mp3"
-                        s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=alternative_key)
                         s3_client.download_file(S3_BUCKET_NAME, alternative_key, str(local_path))
+                        # If the alternative download succeeds, we're good.
                         return True
                     except (ClientError, ValueError):
-                        return False # Not found or parsing error
+                        # The alternative also failed or the name was invalid.
+                        return False
             return False
-        raise
+        else:
+            # Re-raise exceptions that are not 'Not Found' errors.
+            raise
 
 def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_num: int):
     """
