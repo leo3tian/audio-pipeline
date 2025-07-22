@@ -13,11 +13,15 @@ import queue
 import threading
 
 # --- Configuration ---
+# export S3_BUCKET_NAME=sptfy-dataset && export SQS_QUEUE_URL="https://sqs.us-east-2.amazonaws.com/450282239172/huggingface_upload"
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
 S3_PROCESSED_PREFIX = "processed/"
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
 if not SQS_QUEUE_URL:
     raise ValueError("FATAL: The environment variable 'SQS_QUEUE_URL' is not set.")
+AWS_REGION = os.environ.get("AWS_REGION")
+if not AWS_REGION:
+    raise ValueError("FATAL: The environment variable 'AWS_REGION' is not set.")
 S3_UPLOAD_TASKS_PREFIX = "tasks/upload_batches/" 
 
 FILES_PER_TAR_BATCH = 20000
@@ -37,7 +41,8 @@ def list_prefixes_generator(s3_client) -> Iterator[str]:
                 yield prefix['Prefix']
 
 def process_metadata_batch(metadata_queue: queue.Queue, output_file, counter: Dict, stop_event: threading.Event):
-    s3_client = boto3.client('s3')
+    """Process metadata files from the queue and write to output file."""
+    s3_client = boto3.client('s3', region_name=os.environ.get("AWS_REGION"))
     while not stop_event.is_set():
         try:
             prefix = metadata_queue.get(timeout=1.0)
@@ -92,8 +97,8 @@ def setup_upload_tasks():
     uploads them to S3, and sends a message to SQS for each task.
     This script should only be run ONCE to set up the entire upload job.
     """
-    s3_client = boto3.client('s3')
-    sqs_client = boto3.client('sqs')
+    s3_client = boto3.client('s3', region_name=AWS_REGION)
+    sqs_client = boto3.client('sqs', region_name=AWS_REGION)
     
     with tempfile.TemporaryDirectory() as temp_dir:
         master_metadata_path = Path(temp_dir) / "master_metadata.jsonl"

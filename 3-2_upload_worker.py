@@ -19,6 +19,9 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
 if not SQS_QUEUE_URL:
     raise ValueError("FATAL: The environment variable 'SQS_QUEUE_URL' is not set.")
+AWS_REGION = os.environ.get("AWS_REGION")
+if not AWS_REGION:
+    raise ValueError("FATAL: The environment variable 'AWS_REGION' is not set.")
 
 DOWNLOAD_WORKERS = 128
 MAX_EMPTY_RECEIVES = 100 # Number of consecutive empty SQS receives before exiting
@@ -117,8 +120,8 @@ def upload_worker():
     A worker that continuously polls an SQS queue for upload tasks,
     processes them, and deletes them upon completion.
     """
-    s3_client = boto3.client('s3')
-    sqs_client = boto3.client('sqs')
+    s3_client = boto3.client('s3', region_name=AWS_REGION)
+    sqs_client = boto3.client('sqs', region_name=AWS_REGION)
     api = HfApi(token=HF_TOKEN)
     
     worker_id = ''.join(random.choices('0123456789ABCDEF', k=6))
