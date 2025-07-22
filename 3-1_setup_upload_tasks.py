@@ -13,7 +13,7 @@ import queue
 import threading
 
 # --- Configuration ---
-# export S3_BUCKET_NAME=sptfy-dataset && export SQS_QUEUE_URL="https://sqs.us-east-2.amazonaws.com/450282239172/huggingface_upload"
+# export S3_BUCKET_NAME=sptfy-dataset && export SQS_QUEUE_URL="https://sqs.us-east-2.amazonaws.com/450282239172/huggingface_upload" && export AWS_REGION=us-east-2
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
 S3_PROCESSED_PREFIX = "processed/"
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")

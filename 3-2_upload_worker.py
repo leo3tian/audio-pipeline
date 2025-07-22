@@ -26,10 +26,13 @@ if not AWS_REGION:
 DOWNLOAD_WORKERS = 128
 MAX_EMPTY_RECEIVES = 100 # Number of consecutive empty SQS receives before exiting
 
-def download_file(s3_client, s3_key, local_path):
-    """Helper function to download a single file for the thread pool."""
+def download_file(local_path, s3_key):
+    """Helper function to download a single file. Creates its own Boto3 client."""
+    s3_client = boto3.client('s3', region_name=os.environ.get("AWS_REGION"))
     try:
+        # First check if the file exists
         s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+        # If we get here, the file exists, so download it
         s3_client.download_file(S3_BUCKET_NAME, s3_key, str(local_path))
         return True
     except ClientError as e:
@@ -70,15 +73,19 @@ def create_and_upload_batch(api: HfApi, s3_client, batch_records: list, batch_nu
 
         valid_records = []
         with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+            print(f"  Submitting {len(batch_records)} download tasks to the pool...")
+            
+            # This loop now has a progress bar
             future_to_record = {
                 executor.submit(
-                    download_file, 
-                    s3_client, 
-                    record["_s3_key"], 
-                    batch_content_path / os.path.basename(record["_s3_key"])
-                ): record for record in batch_records
+                    download_file,
+                    batch_content_path / os.path.basename(record["_s3_key"]),
+                    record["_s3_key"]
+                ): record 
+                for record in tqdm.tqdm(batch_records, desc="Submitting tasks")
             }
 
+            print("  All tasks submitted. Waiting for downloads to complete...")
             for future in tqdm.tqdm(as_completed(future_to_record), total=len(batch_records), desc=f"Downloading batch #{batch_num}"):
                 record = future_to_record[future]
                 try:
