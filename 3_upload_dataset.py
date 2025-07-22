@@ -19,10 +19,10 @@ S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
 S3_PROCESSED_PREFIX = "processed/"
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "your-hf-username/your-dataset-name")
 HF_TOKEN = os.environ.get("HF_TOKEN")
-FILES_PER_TAR_BATCH = 5000
-DOWNLOAD_WORKERS = 32
-METADATA_SCAN_WORKERS = 64
-PREFIXES_PER_BATCH = 1000  # Process S3 listing in batches
+FILES_PER_TAR_BATCH = 20000
+DOWNLOAD_WORKERS = 128
+METADATA_SCAN_WORKERS = 256
+PREFIXES_PER_BATCH = 2000  # Process S3 listing in batches
 
 def download_file(s3_client, s3_key, local_path):
     """Helper function to download a single file for the thread pool."""
