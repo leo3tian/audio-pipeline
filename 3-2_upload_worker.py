@@ -11,6 +11,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import random
+import threading
 
 # --- Configuration ---
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "yt-pipeline-bucket")
@@ -26,9 +27,19 @@ if not AWS_REGION:
 DOWNLOAD_WORKERS = 128
 MAX_EMPTY_RECEIVES = 100 # Number of consecutive empty SQS receives before exiting
 
+# NEW: Use threading.local to store one Boto3 client per thread.
+thread_local_data = threading.local()
+
+def get_s3_client():
+    """Creates or retrieves a thread-local S3 client."""
+    if not hasattr(thread_local_data, 's3_client'):
+        # This client will be created once per thread and then reused.
+        thread_local_data.s3_client = boto3.client('s3', region_name=AWS_REGION)
+    return thread_local_data.s3_client
+
 def download_file(local_path, s3_key):
-    """Helper function to download a single file. Creates its own Boto3 client."""
-    s3_client = boto3.client('s3', region_name=os.environ.get("AWS_REGION"))
+    """Helper function to download a single file. Uses a thread-local Boto3 client."""
+    s3_client = get_s3_client()
     try:
         # First check if the file exists
         s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
