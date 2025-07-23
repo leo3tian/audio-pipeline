@@ -23,6 +23,7 @@ Thumbs.db
 
 # Downloaded data
 downloads/
+audio_downloads/
 processed/
 *_processed/
 
