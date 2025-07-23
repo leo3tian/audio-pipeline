@@ -2,13 +2,15 @@ import subprocess
 import os
 import random
 
+# Setup - instal curl-cffi for impersonation and ffmpeg for auto converting
+
 # --- Configuration ---
 # Your Oxylabs proxy URL, built from your curl command.
 # Format: http://<username>:<password>@<proxy_host>:<port>
 # The username 'customer-leo3t_n7lBx-cc-US' tells Oxylabs to use a US-based IP.
 # For session rotation, you can add session parameters to the username.
 # e.g., customer-leo3t_n7lBx-cc-US-sessid-RANDOM
-proxy_url = "http://customer-leo3t_n7lBx-cc-US:Weewoo_0242_@pr.oxylabs.io:7777"
+proxy_url = os.environ.get("PROXY_URL")
 
 # The YouTube video you want to download for the test.
 # Using a short, Creative Commons video is great for testing.
