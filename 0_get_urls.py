@@ -2,24 +2,68 @@ import os
 import boto3
 from yt_dlp import YoutubeDL
 import tqdm
+import json
 
 # --- Configuration ---
-S3_BUCKET = "yt-pipeline-bucket"
-# This is the S3 "folder" where the initial video tasks will be created.
-S3_TASKS_PREFIX = "tasks/videos_todo/"
+SQS_QUEUE_URL = os.getenv("AWS_QUEUE_DOWNLOAD")
+if not SQS_QUEUE_URL:
+    raise ValueError("Environment variable AWS_QUEUE_DOWNLOAD must be set")
+
 # The list of YouTube channel URLs you want to process
 CHANNEL_URLS = [
-    "https://www.youtube.com/playlist?list=PLk1Sqn_f33KuWf3tW9BBe_4TP7x8l0m3T"
+    "https://www.youtube.com/@CodeAesthetic"
 ]
+
+def send_messages_in_batches(sqs_client, messages, batch_size=10):
+    """
+    Send messages to SQS in batches of up to 10 (SQS limit).
+    Returns the number of successfully sent messages.
+    """
+    sent_count = 0
+    for i in range(0, len(messages), batch_size):
+        batch = messages[i:i + batch_size]
+        entries = [
+            {
+                'Id': str(j),  # Batch message ID (must be unique within the batch)
+                'MessageBody': json.dumps({
+                    'video_id': msg['video_id'],
+                    'url': msg['url']
+                })
+            }
+            for j, msg in enumerate(batch)
+        ]
+        
+        try:
+            response = sqs_client.send_message_batch(
+                QueueUrl=SQS_QUEUE_URL,
+                Entries=entries
+            )
+            
+            # Count successful sends
+            sent_count += len(entries)
+            
+            # Handle any failed messages
+            if 'Failed' in response and response['Failed']:
+                sent_count -= len(response['Failed'])
+                print("\n[!] Some messages failed to send:")
+                for failed in response['Failed']:
+                    print(f"  - Message {failed['Id']}: {failed['Message']}")
+                    sent_count -= 1
+                    
+        except Exception as e:
+            print(f"\n[!] Error sending batch: {str(e)}")
+            continue
+            
+    return sent_count
 
 def main():
     """
-    Scans YouTube channels to find all video URLs and creates a task file in S3
-    for each individual video. This only needs to be run once to kick off the pipeline.
+    Scans YouTube channels to find all video URLs and sends them to an SQS queue
+    for processing. This only needs to be run once to kick off the pipeline.
     """
     print("0: Starting task setup: fetching all video URLs from channels...")
-    s3_client = boto3.client("s3")
-    all_video_urls = {} # Use a dict to automatically handle duplicates
+    sqs_client = boto3.client("sqs")
+    all_videos = []  # List to store video information before sending
 
     # Use yt-dlp to extract all video URLs from the channels
     ydl_opts = {'extract_flat': True, 'quiet': True, 'ignoreerrors': True}
@@ -32,27 +76,31 @@ def main():
                     for entry in info['entries']:
                         if entry and 'id' in entry:
                             video_id = entry['id']
-                            full_url = f"https://www.youtube.com/watch?v={video_id}"
-                            all_video_urls[video_id] = full_url
+                            url = f"https://www.youtube.com/watch?v={video_id}"
+                            # Store both ID and URL for sending
+                            all_videos.append({
+                                'video_id': video_id,
+                                'url': url
+                            })
             except Exception as e:
-                 print(f"  [!] Could not process channel {channel_url}: {e}")
+                print(f"  [!] Could not process channel {channel_url}: {e}")
 
-    video_count = len(all_video_urls)
+    video_count = len(all_videos)
     if video_count == 0:
         print("\n[!] No videos found. Aborting task setup.")
         return
 
-    print(f"\nFound a total of {video_count} unique videos.")
-    print(f"Creating task files in s3://{S3_BUCKET}/{S3_TASKS_PREFIX}")
+    print(f"\nFound {video_count} unique videos.")
+    print(f"Sending tasks to SQS queue: {SQS_QUEUE_URL}")
     
-    for video_id, url in tqdm.tqdm(all_video_urls.items(), desc="Creating tasks"):
-        task_key = f"{S3_TASKS_PREFIX}{video_id}.task"
-        
-        # The content of the task file is simply the video URL
-        s3_client.put_object(Bucket=S3_BUCKET, Key=task_key, Body=url)
+    # Send messages in batches and track progress
+    sent_count = send_messages_in_batches(sqs_client, all_videos)
             
     print("\n✅ Video task setup complete.")
-    print(f"   {video_count} tasks created in s3://{S3_BUCKET}/{S3_TASKS_PREFIX}")
+    print(f"   {sent_count}/{video_count} tasks sent to SQS queue")
+    
+    if sent_count < video_count:
+        print(f"   [!] Warning: {video_count - sent_count} tasks failed to send")
 
 if __name__ == "__main__":
     main()

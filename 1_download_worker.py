@@ -1,5 +1,4 @@
 import os
-import subprocess
 import multiprocessing
 import tempfile
 from pathlib import Path
@@ -7,168 +6,324 @@ import boto3
 from botocore.exceptions import ClientError
 from yt_dlp import YoutubeDL
 import time
+import json
+import subprocess
+import shutil
 import random
+import logging
+from datetime import datetime
 
 # --- Configuration ---
-S3_BUCKET = "yt-pipeline-bucket"
-# The S3 "folder" where the final raw audio files will be stored.
+S3_BUCKET = "youtube-dataset-west"
+# The S3 "folder" where the final raw audio files will be stored
 S3_RAW_AUDIO_PREFIX = "raw_audio/"
-# The base "folder" for all our task files.
-S3_TASKS_BASE_PREFIX = "tasks/"
-# The audio format and sample rate we will standardize to.
-SAMPLE_RATE = 24000
-# Number of downloader processes to run per instance.
-NUM_WORKERS =  multiprocessing.cpu_count()
-MAX_CONSECUTIVE_FAILURES = 20
-NUM_COOKIES = 4
 
-def claim_video_task(s3_client):
-    """
-    Finds a video task in 'videos_todo/', moves it to 'videos_in_progress/',
-    and returns the task details.
-    """
-    todo_prefix = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_todo/')
-    paginator = s3_client.get_paginator('list_objects_v2')
-    pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=todo_prefix, MaxKeys=10)
+# SQS Configuration
+SQS_QUEUE_URL = os.getenv("AWS_QUEUE_DOWNLOAD")
+if not SQS_QUEUE_URL:
+    raise ValueError("Environment variable AWS_QUEUE_DOWNLOAD must be set")
+
+# Worker Configuration
+NUM_WORKERS = 1
+MAX_CONSECUTIVE_FAILURES = 5
+# How long to wait for new messages (long polling)
+SQS_WAIT_TIME = 20
+# Maximum number of messages to receive at once
+SQS_BATCH_SIZE = 1
+
+# Download speed configuration (in bytes/s)
+MAX_DOWNLOAD_SPEED = 6_250_000  # 50 Mbps
+MIN_DOWNLOAD_SPEED = 4_000_000  # 32 Mbps
+# Rest period between videos (in seconds)
+MIN_REST_PERIOD = 30
+MAX_REST_PERIOD = 60
+
+# Logging Configuration
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+def check_dependencies():
+    """Check if required command-line tools are available."""
+    missing = []
     
-    for page in pages:
-        if 'Contents' not in page:
-            continue
-        
-        tasks = page['Contents']
-        random.shuffle(tasks) # Randomize to reduce contention between workers
+    # Check for ffmpeg
+    if not shutil.which('ffmpeg'):
+        missing.append('ffmpeg')
+    
+    if missing:
+        raise RuntimeError(
+            f"Missing required dependencies: {', '.join(missing)}. "
+            "Please install them before running this script.\n"
+            "On Ubuntu/Debian: sudo apt-get install ffmpeg\n"
+            "On macOS: brew install ffmpeg\n"
+            "On Windows: choco install ffmpeg"
+        )
 
-        for obj in tasks:
-            task_key = obj['Key']
-            if not task_key.endswith('.task'):
-                continue
-
-            video_id = os.path.basename(task_key).replace('.task', '')
-            in_progress_key = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_in_progress', f"{video_id}.task")
-
-            try:
-                s3_client.copy_object(
-                    Bucket=S3_BUCKET,
-                    CopySource={'Bucket': S3_BUCKET, 'Key': task_key},
-                    Key=in_progress_key
-                )
-                s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
-                
-                task_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=in_progress_key)
-                video_url = task_obj['Body'].read().decode('utf-8')
-                
-                return {'key': in_progress_key, 'url': video_url, 'video_id': video_id}
-            
-            except ClientError as e:
-                if e.response['Error']['Code'] in ['NoSuchKey', '404']:
-                    continue
-                else:
-                    raise
-    return None
-
-def complete_video_task(s3_client, task_key):
+def convert_to_m4a(input_path: Path, output_path: Path) -> bool:
     """
-    Moves a completed video task file to the 'videos_completed' directory.
-    This is now robust against race conditions where another worker completes the task first.
+    Convert audio file to M4A format using ffmpeg.
+    Returns True if conversion was successful.
     """
-    video_id = os.path.basename(task_key).replace('.task', '')
-    completed_key = os.path.join(S3_TASKS_BASE_PREFIX, 'videos_completed', f"{video_id}.task")
     try:
-        # Check if the in-progress file still exists before trying to move it.
-        s3_client.head_object(Bucket=S3_BUCKET, Key=task_key)
-        
-        # If it exists, move it.
-        s3_client.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': task_key}, Key=completed_key)
-        s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
-    except ClientError as e:
-        # If the key is not found, it means another worker already completed it. This is not an error.
-        if e.response['Error']['Code'] == '404':
-            print(f"  Note: Task {video_id} was already completed by another worker.")
-        else:
-            # Re-raise other unexpected S3 errors.
-            raise
-
-def download_and_convert_to_flac(video_url: str, temp_dir: Path, cookie_num: int):
-    """Downloads a single video and converts it to a standardized FLAC file."""
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': str(temp_dir / '%(id)s.%(ext)s'),
-        'quiet': True,
-        'ignoreerrors': True,
-        'cookiefile': f'/home/ec2-user/cookies{cookie_num}.txt'
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        if not info:
-            raise ValueError("yt-dlp returned no info")
-        
-        video_id = info['id']
-        input_path = ydl.prepare_filename(info)
-        output_path = temp_dir / f"{video_id}.flac"
-
-        ffmpeg_cmd = [
-            'ffmpeg', '-i', str(input_path), '-vn', '-ar', str(SAMPLE_RATE),
-            '-ac', '1', '-sample_fmt', 's16', str(output_path)
+        # Use ffmpeg to convert to M4A with AAC codec
+        cmd = [
+            'ffmpeg',
+            '-y',  # Overwrite output file if it exists
+            '-i', str(input_path),  # Input file
+            '-c:a', 'aac',  # Use AAC codec
+            '-b:a', '128k',  # Set bitrate to 128kbps
+            '-movflags', '+faststart',  # Optimize for streaming
+            str(output_path)  # Output file
         ]
-        subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
-        return output_path
+        
+        # Run ffmpeg silently unless there's an error
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"  FFmpeg conversion failed: {result.stderr}")
+            return False
+            
+        return output_path.exists()
+        
+    except Exception as e:
+        print(f"  Conversion error: {str(e)}")
+        return False
+
+def receive_task(sqs_client):
+    """
+    Receives a task from the SQS queue.
+    Returns None if no tasks are available.
+    """
+    try:
+        response = sqs_client.receive_message(
+            QueueUrl=SQS_QUEUE_URL,
+            MaxNumberOfMessages=SQS_BATCH_SIZE,
+            WaitTimeSeconds=SQS_WAIT_TIME,
+            AttributeNames=['All']
+        )
+        
+        if 'Messages' not in response:
+            return None
+            
+        message = response['Messages'][0]  # We only asked for 1 message
+        try:
+            body = json.loads(message['Body'])
+            return {
+                'receipt_handle': message['ReceiptHandle'],
+                'video_id': body['video_id'],
+                'url': body['url']
+            }
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"  [!] Invalid message format: {e}")
+            # Delete malformed message so it doesn't block the queue
+            sqs_client.delete_message(
+                QueueUrl=SQS_QUEUE_URL,
+                ReceiptHandle=message['ReceiptHandle']
+            )
+            return None
+            
+    except Exception as e:
+        print(f"  [!] Error receiving message: {e}")
+        return None
+
+def delete_task(sqs_client, receipt_handle):
+    """
+    Deletes a completed task from the SQS queue.
+    """
+    try:
+        sqs_client.delete_message(
+            QueueUrl=SQS_QUEUE_URL,
+            ReceiptHandle=receipt_handle
+        )
+        return True
+    except Exception as e:
+        print(f"  [!] Failed to delete message: {e}")
+        return False
+
+def setup_logging(worker_rank: int):
+    """Setup logging for a worker process."""
+    # Create a logger for this worker
+    logger = logging.getLogger(f"worker-{worker_rank}")
+    logger.setLevel(logging.INFO)
+    
+    # Prevent duplicate handlers
+    if logger.handlers:
+        return logger
+        
+    # Console handler - only INFO and above
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console_fmt = logging.Formatter('%(message)s')
+    console.setFormatter(console_fmt)
+    
+    # File handler - DEBUG and above, with timestamps and more detail
+    log_file = LOG_DIR / f"worker_{worker_rank}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    file_handler.setFormatter(file_fmt)
+    
+    logger.addHandler(console)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+def random_rest():
+    """Take a random rest between videos to avoid patterns."""
+    return random.uniform(MIN_REST_PERIOD, MAX_REST_PERIOD)
+
+def download_audio(video_url: str, temp_dir: Path, worker_rank: int, logger: logging.Logger):
+    """Downloads a single video's audio and ensures it's in M4A format."""
+    ydl_opts = {
+        # --- Format Selection ---
+        'format': 'bestaudio[abr<=128]/bestaudio',  # Allow any audio format
+        'outtmpl': str(temp_dir / '%(id)s.%(ext)s'),
+        
+        # --- Browser Impersonation & Headers ---
+        'http_headers': {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'DNT': '1',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+        },
+        'impersonate_target': 'chrome',  # Latest Chrome
+        
+        # --- Download Settings ---
+        'retries': 3,              # Reduced retries
+        'fragment_retries': 3,     # Reduced fragment retries
+        'skip_unavailable_fragments': True,
+        'keepvideo': False,        # Delete video after audio extraction
+        
+        # --- Rate Limiting ---
+        'ratelimit': MAX_DOWNLOAD_SPEED,      # 50 Mbps max
+        'throttledratelimit': MIN_DOWNLOAD_SPEED,  # Allow drops to 32 Mbps
+        
+        # --- Error Handling ---
+        'ignoreerrors': True,      # Skip unavailable videos
+        'verbose': False,          # Hide debug info
+        'quiet': True,  # Suppress yt-dlp's output
+        
+        # --- Misc ---
+        'no_playlist': True,       # Don't download playlists by accident
+        'extract_audio': True,     # Extract audio
+        'postprocessor_args': [
+            '-ar', '44100',        # Sample rate
+            '-ac', '2',            # Stereo
+            '-b:a', '128k',        # Bitrate
+        ],
+        
+        # --- Additional Optimizations ---
+        'socket_timeout': 20,      # Socket timeout
+        'retry_sleep_functions': False,  # Don't sleep between retries
+        'file_access_retries': 3,  # Reduce file access retries
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        try:
+            logger.info(f"⏬ Downloading {video_url}")
+            info = ydl.extract_info(video_url, download=True)
+            if not info:
+                raise ValueError("yt-dlp returned no info")
+            
+            video_id = info['id']
+            downloaded_path = Path(ydl.prepare_filename(info))
+            
+            if not downloaded_path.exists():
+                raise FileNotFoundError(f"Download failed - file not found: {downloaded_path}")
+            
+            # Ensure we have an M4A file
+            output_path = temp_dir / f"{video_id}.m4a"
+            if downloaded_path.suffix != '.m4a':
+                logger.debug(f"Converting {downloaded_path.suffix} to M4A...")
+                if not convert_to_m4a(downloaded_path, output_path):
+                    raise RuntimeError(f"Failed to convert {downloaded_path} to M4A")
+                downloaded_path.unlink()  # Remove the original file
+            else:
+                # If it's already M4A, just rename it
+                downloaded_path.rename(output_path)
+            
+            if not output_path.exists():
+                raise FileNotFoundError(f"Final M4A file not found: {output_path}")
+                
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Download failed: {type(e).__name__}: {str(e)}")
+            logger.debug("Full traceback:", exc_info=True)
+            raise
 
 def downloader_worker(rank: int, failure_counter):
     """A worker process that continuously claims and processes video download tasks."""
+    logger = setup_logging(rank)
     s3_client = boto3.client('s3')
-    print(f"Downloader-{rank}: Starting...")
+    sqs_client = boto3.client('sqs')
+    logger.info(f"Worker-{rank} started")
     
     while True:
-        video_task = claim_video_task(s3_client)
         if failure_counter.value >= MAX_CONSECUTIVE_FAILURES:
-            print(f"Downloader-{rank}: Max failures reached ({MAX_CONSECUTIVE_FAILURES}). Exiting.")
+            logger.error(f"Max failures reached ({MAX_CONSECUTIVE_FAILURES}). Exiting.")
             break
 
-        if not video_task:
-            print(f"Downloader-{rank}: No more video tasks found. Exiting.")
+        task = receive_task(sqs_client)
+        if not task:
+            logger.info("No more tasks found. Exiting.")
             break
 
-        video_id = video_task['video_id']
-        video_url = video_task['url']
-        print(f"Downloader-{rank}: Claimed task for video: {video_id}")
+        video_id = task['video_id']
+        video_url = task['url']
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                flac_path = download_and_convert_to_flac(video_url, Path(temp_dir), rank % NUM_COOKIES)
+                audio_path = download_audio(video_url, Path(temp_dir), rank, logger)
                 
-                s3_key = f"{S3_RAW_AUDIO_PREFIX}{video_id}.flac"
-                print(f"  Downloader-{rank}: Uploading {video_id}.flac to S3...")
-                s3_client.upload_file(str(flac_path), S3_BUCKET, s3_key)
+                s3_key = f"{S3_RAW_AUDIO_PREFIX}{video_id}.m4a"
+                logger.debug(f"Uploading to S3: {s3_key}")
+                s3_client.upload_file(str(audio_path), S3_BUCKET, s3_key)
             
-            complete_video_task(s3_client, video_task['key'])
-            print(f"  Downloader-{rank}: ✅ Finished and completed task for video: {video_id}")
-            failure_counter.value = 0
+            if delete_task(sqs_client, task['receipt_handle']):
+                logger.info(f"✅ Finished {video_id}")
+                failure_counter.value = 0
+                
+                rest_time = random_rest()
+                logger.info(f"😴 Resting for {rest_time:.1f}s...")
+                time.sleep(rest_time)
+            else:
+                logger.warning(f"Task completed but failed to delete message for: {video_id}")
+                failure_counter.value += 1
 
         except Exception as e:
-            print(f"  Downloader-{rank}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
-            # --- MODIFIED: Increment the shared failure counter ---
+            logger.error(f"CRITICAL FAILURE on {video_id}: {type(e).__name__}: {str(e)}")
+            logger.debug("Full traceback:", exc_info=True)
+            
             failure_counter.value += 1
-            time.sleep(10)
+            backoff = min(2 ** (failure_counter.value - 1), 5)
+            logger.info(f"Backing off for {backoff:.1f}s...")
+            time.sleep(backoff)
 
 def main():
     """Orchestrates the pool of downloader worker processes."""
-    # --- MODIFIED: Create a manager and a shared failure counter ---
+    try:
+        check_dependencies()
+    except RuntimeError as e:
+        print(f"\n❌ {str(e)}")
+        return
+
     manager = multiprocessing.Manager()
     failure_counter = manager.Value('i', 0)
     
     processes = []
-    print(f"🚀 Starting {NUM_WORKERS} downloader worker processes...")
+    print(f"🚀 Starting {NUM_WORKERS} worker(s)...")
     for i in range(NUM_WORKERS):
-        # --- MODIFIED: Pass the failure counter to each worker ---
         p = multiprocessing.Process(target=downloader_worker, args=(i, failure_counter))
         p.start()
         processes.append(p)
 
     for p in processes:
         p.join()
-        
-    # --- MODIFIED: Print the final failure count ---
-    print("\n✅ All downloader workers have finished.")
+    
+    print("\n✅ All workers finished.")
     print(f"    Total failures: {failure_counter.value}")
 
 

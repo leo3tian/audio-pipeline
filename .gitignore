@@ -11,6 +11,7 @@ venv/
 # Logs and outputs
 *.log
 *.out
+/logs
 
 # Jupyter and IDE files
 *.ipynb
