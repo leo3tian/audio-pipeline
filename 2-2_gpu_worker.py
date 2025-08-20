@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
+from botocore.config import Config
 import time
 import random
 import sys
@@ -14,16 +15,21 @@ from concurrent.futures import ThreadPoolExecutor
 import tqdm
 
 # --- Configuration ---
-S3_BUCKET = os.environ.get("WORKER_BUCKET")
+S3_BUCKET = os.environ.get("R2_BUCKET")
 if S3_BUCKET is None:
-    raise ValueError("FATAL: The environment variable 'WORKER_BUCKET' is not set. Please set it to your S3 bucket name.")
+    raise ValueError("FATAL: The environment variable 'R2_BUCKET' is not set. Please set it to your R2 bucket name.")
 
-S3_RAW_AUDIO_PREFIX = "raw-audio/"
-S3_PROCESSED_PREFIX = "processed/"
-S3_TASKS_BASE_PREFIX = "tasks/"
+S3_RAW_AUDIO_PREFIX = os.environ.get("RAW_AUDIO_PREFIX", "raw_audio/")
+S3_PROCESSED_PREFIX = os.environ.get("PROCESSED_PREFIX", "processed/")
+S3_TASKS_BASE_PREFIX = os.environ.get("TASKS_BASE_PREFIX", "tasks/")
 EMILIA_CONFIG_PATH = "Emilia/config.json"
 WORKERS_PER_GPU = int(os.environ.get("WORKERS_PER_GPU", 1))
 MAX_GPUS = int(os.environ.get("MAX_GPUS", 999))
+
+# Allow configuring model devices and separation chunk size
+SEPARATION_DEVICE = os.environ.get("SEPARATION_DEVICE", "cuda")
+DNSMOS_DEVICE = os.environ.get("DNSMOS_DEVICE", "cuda")
+SEPARATION_CHUNKS_ENV = os.environ.get("SEPARATION_CHUNKS")
 
 # --- Emilia Config ---
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 12))
@@ -31,6 +37,24 @@ WHISPER_ARCH = "medium"
 COMPUTE_TYPE = "float16"
 CPU_THREADS = 4
 ASR_LANGUAGE = os.environ.get("ASR_LANGUAGE", None)
+
+
+def create_r2_client():
+    """Create an S3-compatible client for Cloudflare R2 only."""
+    endpoint_url = os.environ.get("R2_ENDPOINT_URL") or os.environ.get("R2_ENDPOINT")
+    access_key = os.environ.get("R2_ACCESS_KEY_ID")
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY")
+    if not endpoint_url or not access_key or not secret_key:
+        raise ValueError("R2 configuration missing. Set R2_ENDPOINT_URL (or R2_ENDPOINT), R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.")
+    base_config = Config(signature_version="s3v4", s3={"addressing_style": "path"})
+    return boto3.client(
+        service_name="s3",
+        endpoint_url=endpoint_url,
+        region_name="auto",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=base_config,
+    )
 
 
 def claim_processing_task(s3_client):
@@ -49,11 +73,30 @@ def claim_processing_task(s3_client):
                 continue
             try:
                 task_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=task_key)
-                video_id = task_obj['Body'].read().decode('utf-8')
+                body = task_obj['Body'].read().decode('utf-8')
+                task_payload = json.loads(body)
+                episode_id = task_payload.get("episode_id")
+                language = task_payload.get("language")
+                audio_key = task_payload.get("audio_key")
+                # Fallback: derive language from audio_key if missing/empty
+                if (not language) and audio_key:
+                    segs = audio_key.strip('/').split('/')
+                    if 'raw_audio' in segs:
+                        idx = segs.index('raw_audio')
+                        if idx + 1 < len(segs):
+                            language = segs[idx + 1]
+                            task_payload["language"] = language
+                            body = json.dumps(task_payload)
+                # move to in_progress
                 s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
-                in_progress_key = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_in_progress', f"{video_id}.task")
-                s3_client.put_object(Bucket=S3_BUCKET, Key=in_progress_key, Body=video_id)
-                return {'key': in_progress_key, 'video_id': video_id}
+                in_progress_key = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_in_progress', f"{episode_id}.task")
+                s3_client.put_object(Bucket=S3_BUCKET, Key=in_progress_key, Body=body)
+                return {
+                    'key': in_progress_key,
+                    'episode_id': episode_id,
+                    'language': language,
+                    'audio_key': audio_key,
+                }
             except ClientError as e:
                 if e.response['Error']['Code'] in ['NoSuchKey', '404']:
                     continue
@@ -61,28 +104,29 @@ def claim_processing_task(s3_client):
                     raise
     return None
 
+
 def complete_processing_task(s3_client, task_key):
     """Moves a completed processing task file to the 'processing_completed' directory."""
-    video_id = os.path.basename(task_key).replace('.task', '')
-    completed_key = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_completed', f"{video_id}.task")
+    episode_id = os.path.basename(task_key).replace('.task', '')
+    completed_key = os.path.join(S3_TASKS_BASE_PREFIX, 'processing_completed', f"{episode_id}.task")
     try:
         s3_client.head_object(Bucket=S3_BUCKET, Key=task_key)
         s3_client.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': task_key}, Key=completed_key)
         s3_client.delete_object(Bucket=S3_BUCKET, Key=task_key)
     except ClientError as e:
         if e.response['Error']['Code'] == '404':
-            print(f"  Note: Task for {video_id} was already completed by another worker.")
+            print(f"  Note: Task for {episode_id} was already completed by another worker.")
         else:
-            print(f"  Warning: Unexpected S3 error while completing task {task_key}: {e}")
+            print(f"  Warning: Unexpected R2 error while completing task {task_key}: {e}")
             raise
 
-def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str):
-    """Uploads the contents of a directory to a specific S3 prefix in parallel."""
-    s3_client = boto3.client("s3")
+
+def upload_directory_to_r2(s3_client, local_directory: Path, s3_bucket: str, s3_prefix: str):
+    """Uploads the contents of a directory to a specific R2 prefix in parallel."""
     files_to_upload = [f for f in local_directory.rglob("*") if f.is_file()]
     if not files_to_upload:
         return
-    print(f"  Starting parallel upload of {len(files_to_upload)} files to s3://{s3_bucket}/{s3_prefix}")
+    print(f"  Starting parallel upload of {len(files_to_upload)} files to r2://{s3_bucket}/{s3_prefix}")
     def _upload_file(local_file_path):
         s3_key = f"{s3_prefix}/{local_file_path.relative_to(local_directory)}"
         try:
@@ -90,7 +134,8 @@ def upload_directory_to_s3(local_directory: Path, s3_bucket: str, s3_prefix: str
         except Exception as e:
             print(f"  [!] Failed to upload {local_file_path}: {e}")
     with ThreadPoolExecutor(max_workers=50) as executor:
-        list(tqdm.tqdm(executor.map(_upload_file, files_to_upload), total=len(files_to_upload), desc="Uploading to S3"))
+        list(tqdm.tqdm(executor.map(_upload_file, files_to_upload), total=len(files_to_upload), desc="Uploading to R2"))
+
 
 def processing_worker(rank: int, assigned_gpu_id: str):
     """
@@ -109,7 +154,7 @@ def processing_worker(rank: int, assigned_gpu_id: str):
 
     device_id_for_process = 0 
     
-    s3_client = boto3.client('s3')
+    s3_client = create_r2_client()
     print(f"Worker-{rank} on Physical-GPU-{assigned_gpu_id}: Starting...")
 
     print(f"Worker-{rank} on Physical-GPU-{assigned_gpu_id}: Loading all models into memory...")
@@ -119,6 +164,14 @@ def processing_worker(rank: int, assigned_gpu_id: str):
     
     cfg = load_cfg(EMILIA_CONFIG_PATH)
     cfg["huggingface_token"] = os.getenv("HF_TOKEN")
+
+    # Optional: reduce separation chunk size to lower peak memory
+    if SEPARATION_CHUNKS_ENV:
+        try:
+            cfg["separate"]["step1"]["chunks"] = int(SEPARATION_CHUNKS_ENV)
+            print(f"Worker-{rank} on Physical-GPU-{assigned_gpu_id}: Using separation chunks={cfg['separate']['step1']['chunks']}")
+        except Exception:
+            pass
 
     diarizer_model = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=cfg["huggingface_token"])
     diarizer_model.to(torch_device)
@@ -133,12 +186,12 @@ def processing_worker(rank: int, assigned_gpu_id: str):
     vad_model = silero_vad.SileroVAD(device=torch_device)
     separator_model = separate_fast.Predictor(
         args=cfg["separate"]["step1"], 
-        device=generic_cuda_device, 
+        device=(SEPARATION_DEVICE if SEPARATION_DEVICE in ("cuda", "cpu") else generic_cuda_device), 
         device_index=device_id_for_process
     )
     dnsmos_model = dnsmos.ComputeScore(
         cfg["mos_model"]["primary_model_path"], 
-        device=generic_cuda_device,
+        device=(DNSMOS_DEVICE if DNSMOS_DEVICE in ("cuda", "cpu") else generic_cuda_device),
         device_index=device_id_for_process
     )
     
@@ -152,33 +205,38 @@ def processing_worker(rank: int, assigned_gpu_id: str):
         task = claim_processing_task(s3_client)
         if not task:
             break
-        video_id = task['video_id']
-        print(f"Worker-{rank} on Physical-GPU-{assigned_gpu_id}: Claimed task for video: {video_id}")
+        episode_id = task['episode_id']
+        language = task['language']
+        audio_key = task['audio_key']
+        print(f"Worker-{rank} on Physical-GPU-{assigned_gpu_id}: Claimed task for episode: {episode_id} ({language})")
         try:
             with tempfile.TemporaryDirectory(prefix=f"gpu_worker_{assigned_gpu_id}_{rank}_") as temp_dir:
-                s3_search_prefix = f"{S3_RAW_AUDIO_PREFIX}{video_id}"
-                response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_search_prefix, MaxKeys=1)
-                if 'Contents' not in response or not response['Contents']:
-                    raise FileNotFoundError(f"Could not find any audio file for video_id: {video_id}")
-                s3_audio_key = response['Contents'][0]['Key']
-                local_filename = os.path.basename(s3_audio_key)
+                local_filename = os.path.basename(audio_key)
                 local_audio_path = Path(temp_dir) / local_filename
-                s3_client.download_file(S3_BUCKET, s3_audio_key, str(local_audio_path))
+                s3_client.download_file(S3_BUCKET, audio_key, str(local_audio_path))
+                # Quick sanity check to avoid ffmpeg errors on empty/corrupt downloads
+                try:
+                    if local_audio_path.stat().st_size < 1024:
+                        raise ValueError(f"Downloaded file too small: {local_audio_path} ({local_audio_path.stat().st_size} bytes)")
+                except Exception as e:
+                    raise
                 emilia_output_dir = Path(temp_dir) / "processed"
                 os.makedirs(emilia_output_dir, exist_ok=True)
                 main_process(
                     audio_path=str(local_audio_path), models=models, cfg=cfg,
                     device=torch_device, batch_size=BATCH_SIZE,
-                    save_path=str(emilia_output_dir), audio_name=video_id
+                    save_path=str(emilia_output_dir), audio_name=episode_id
                 )
-                s3_processed_prefix = f"{S3_PROCESSED_PREFIX}{video_id}"
-                upload_directory_to_s3(emilia_output_dir, S3_BUCKET, s3_processed_prefix)
+                # Upload under processed/{language}/{episode_id}/
+                safe_language = (language or '').strip() or 'unknown'
+                s3_processed_prefix = f"{S3_PROCESSED_PREFIX}{safe_language}/{episode_id}"
+                upload_directory_to_r2(s3_client, emilia_output_dir, S3_BUCKET, s3_processed_prefix)
             
             complete_processing_task(s3_client, task['key'])
-            print(f"  Worker-{rank} on Physical-GPU-{assigned_gpu_id}: ✅ Finished and completed task for video: {video_id}")
+            print(f"  Worker-{rank} on Physical-GPU-{assigned_gpu_id}: ✅ Finished and completed task for episode: {episode_id}")
 
         except Exception as e:
-            print(f"  Worker-{rank} on Physical-GPU-{assigned_gpu_id}: [!!!] CRITICAL FAILURE on video {video_id}. Error: {e}")
+            print(f"  Worker-{rank} on Physical-GPU-{assigned_gpu_id}: [!!!] CRITICAL FAILURE on episode {episode_id}. Error: {e}")
             time.sleep(10)
         finally:
             torch.cuda.empty_cache()
@@ -192,10 +250,12 @@ def get_available_gpus() -> list:
     except Exception:
         return []
 
+
 def worker_launcher(rank: int, assigned_gpu_id: str):
     """Sets the environment for a worker and then calls the main worker function."""
     os.environ["CUDA_VISIBLE_DEVICES"] = assigned_gpu_id
     processing_worker(rank, assigned_gpu_id)
+
 
 def main():
     """Orchestrates the pool of GPU worker processes."""

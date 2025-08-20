@@ -14,6 +14,44 @@ import onnxruntime as ort
 from tqdm import tqdm
 
 
+def _build_cuda_provider_options(device_index: int):
+    import os
+    try:
+        import torch as _torch
+    except Exception:
+        _torch = None
+    mem_limit_gb = os.environ.get("ORT_CUDA_MEM_LIMIT_GB")
+    mem_fraction = os.environ.get("ORT_CUDA_MEM_LIMIT_FRACTION")
+    arena_strategy = os.environ.get("ORT_CUDA_ARENA_EXTEND_STRATEGY", "kSameAsRequested")
+    cudnn_algo_search = os.environ.get("ORT_CUDNN_CONV_ALGO_SEARCH", "DEFAULT")
+    cudnn_use_max_workspace = os.environ.get("ORT_CUDNN_USE_MAX_WORKSPACE", "0")
+
+    gpu_mem_limit = None
+    if mem_limit_gb:
+        try:
+            gpu_mem_limit = int(float(mem_limit_gb) * (1024 ** 3))
+        except Exception:
+            gpu_mem_limit = None
+    elif mem_fraction:
+        try:
+            fraction = float(mem_fraction)
+            if _torch is not None and 0 < fraction <= 1:
+                total = _torch.cuda.get_device_properties(0).total_memory
+                gpu_mem_limit = int(total * fraction)
+        except Exception:
+            gpu_mem_limit = None
+
+    opts = {
+        "device_id": str(device_index),
+        "arena_extend_strategy": arena_strategy,
+        "cudnn_conv_algo_search": cudnn_algo_search,
+        "cudnn_conv_use_max_workspace": cudnn_use_max_workspace,
+    }
+    if gpu_mem_limit is not None:
+        opts["gpu_mem_limit"] = gpu_mem_limit
+    return opts
+
+
 class ConvTDFNet:
     """
     ConvTDFNet - Convolutional Temporal Frequency Domain Network.
@@ -89,11 +127,11 @@ class Predictor:
 
         if device == "cuda":
             ## FIX: Explicitly tell the CUDAExecutionProvider which device ID to use.
-            provider_options = [{'device_id': str(device_index)}]
+            provider_options = _build_cuda_provider_options(device_index)
             self.model = ort.InferenceSession(
                 args["model_path"], 
                 providers=['CUDAExecutionProvider'],
-                provider_options=provider_options
+                provider_options=[provider_options]
             )
         elif device == "cpu":
             self.model = ort.InferenceSession(

@@ -1,3 +1,5 @@
+# reqs:
+# pip install yt-dlp boto3 curl-cffi
 import os
 import multiprocessing
 import tempfile
@@ -41,6 +43,44 @@ MAX_REST_PERIOD = 60
 # Logging Configuration
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
+
+class DownloadTracker:
+    def __init__(self, logger):
+        self.start_time = None
+        self.downloaded_bytes = 0
+        self.total_bytes = 0
+        self.logger = logger
+        self.speeds = []
+        
+    def progress_hook(self, d):
+        if d['status'] == 'downloading':
+            if not self.start_time:
+                self.start_time = time.time()
+            
+            # Track download progress
+            self.downloaded_bytes = d.get('downloaded_bytes', 0)
+            self.total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+            
+            # Calculate current speed
+            speed = d.get('speed', 0)
+            if speed:
+                self.speeds.append(speed)
+        
+        elif d['status'] == 'finished':
+            if self.start_time and self.speeds:
+                duration = time.time() - self.start_time
+                avg_speed = sum(self.speeds) / len(self.speeds)
+                max_speed = max(self.speeds)
+                
+                # Convert to MB/s for readability
+                avg_speed_mb = avg_speed / (1024 * 1024)
+                max_speed_mb = max_speed / (1024 * 1024)
+                
+                self.logger.info(
+                    f"📊 Download stats: {duration:.1f}s, "
+                    f"avg: {avg_speed_mb:.1f} MB/s, "
+                    f"max: {max_speed_mb:.1f} MB/s"
+                )
 
 def check_dependencies():
     """Check if required command-line tools are available."""
@@ -174,6 +214,8 @@ def random_rest():
 
 def download_audio(video_url: str, temp_dir: Path, worker_rank: int, logger: logging.Logger):
     """Downloads a single video's audio and ensures it's in M4A format."""
+    tracker = DownloadTracker(logger)
+    
     ydl_opts = {
         # --- Format Selection ---
         'format': 'bestaudio[abr<=128]/bestaudio',  # Allow any audio format
@@ -204,6 +246,9 @@ def download_audio(video_url: str, temp_dir: Path, worker_rank: int, logger: log
         'ignoreerrors': True,      # Skip unavailable videos
         'verbose': False,          # Hide debug info
         'quiet': True,  # Suppress yt-dlp's output
+        
+        # --- Progress Monitoring ---
+        'progress_hooks': [tracker.progress_hook],
         
         # --- Misc ---
         'no_playlist': True,       # Don't download playlists by accident

@@ -11,7 +11,7 @@ if not SQS_QUEUE_URL:
 
 # The list of YouTube channel URLs you want to process
 CHANNEL_URLS = [
-    "https://www.youtube.com/@CodeAesthetic"
+    "https://www.youtube.com/playlist?list=PLk1Sqn_f33KuWf3tW9BBe_4TP7x8l0m3T"
 ]
 
 def send_messages_in_batches(sqs_client, messages, batch_size=10):

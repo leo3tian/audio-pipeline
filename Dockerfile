@@ -34,17 +34,22 @@ COPY Emilia/env.sh Emilia/env.sh
 #    /opt/conda/bin/conda run -n AudioPipeline bash -c "cd Emilia && bash env.sh"
 
 RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
-    /opt/conda/envs/AudioPipeline/bin/conda install -n AudioPipeline ffmpeg -y && \
-    /opt/conda/envs/AudioPipeline/bin/conda install -n AudioPipeline \
-        pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia -y && \
-    /opt/conda/envs/AudioPipeline/bin/pip install -r requirements.txt && \
+    /opt/conda/bin/conda install -n AudioPipeline -y ffmpeg && \
+    /opt/conda/bin/conda install -n AudioPipeline -c pytorch -c nvidia -y \
+        pytorch torchvision torchaudio pytorch-cuda=12.4 && \
+    /opt/conda/bin/conda run -n AudioPipeline pip install -r requirements.txt && \
     /opt/conda/bin/conda clean -a -y
+
+# Ensure onnxruntime GPU wheel is installed (and not the CPU wheel), then verify CUDA EP
+RUN /opt/conda/bin/conda run -n AudioPipeline pip uninstall -y onnxruntime onnxruntime-gpu && \
+    /opt/conda/bin/conda run -n AudioPipeline pip install --no-cache-dir onnxruntime-gpu==1.19.2 && \
+    /opt/conda/bin/conda run -n AudioPipeline python -c "import onnxruntime as ort; provs=ort.get_available_providers(); print('onnxruntime providers:', provs); assert 'CUDAExecutionProvider' in provs, provs"
 
 
 COPY . .
 
 # Cache models
-RUN /opt/conda/envs/AudioPipeline/bin/python cache_models.py
+RUN /opt/conda/bin/conda run -n AudioPipeline python cache_models.py
 
 # Activate conda env
 RUN { \

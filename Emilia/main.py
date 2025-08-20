@@ -12,22 +12,22 @@ import os
 import tqdm
 
 # Define a mock class that safely mimics tqdm's behavior but does nothing.
-class _TqdmMock:
-    """A mock class to replace tqdm and suppress all output."""
-    def __init__(self, iterable=None, *args, **kwargs):
-        self.iterable = iterable
+# class _TqdmMock:
+#     """A mock class to replace tqdm and suppress all output."""
+#     def __init__(self, iterable=None, *args, **kwargs):
+#         self.iterable = iterable
 
-    def __iter__(self):
-        # Allow the object to be used in for loops
-        return iter(self.iterable if self.iterable is not None else [])
+#     def __iter__(self):
+#         # Allow the object to be used in for loops
+#         return iter(self.iterable if self.iterable is not None else [])
 
-    # This is the key: a catch-all for any method calls
-    def __getattr__(self, *args, **kwargs):
-        """Catch any method call (.set_description, .update, etc.) and do nothing."""
-        return lambda *args, **kwargs: None
+#     # This is the key: a catch-all for any method calls
+#     def __getattr__(self, *args, **kwargs):
+#         """Catch any method call (.set_description, .update, etc.) and do nothing."""
+#         return lambda *args, **kwargs: None
 
-# Replace the real tqdm with our silent mock class
-tqdm.tqdm = _TqdmMock
+# # Replace the real tqdm with our silent mock class
+# tqdm.tqdm = _TqdmMock
 
 import warnings
 import logging
@@ -64,7 +64,7 @@ class ModelPack(TypedDict):
 
 # The logger is initialized globally so it can be accessed by all functions.
 logger = Logger.get_logger()
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
 
 
 # --- OPTIMIZED I/O FUNCTIONS ---
@@ -209,8 +209,15 @@ def source_separation(predictor, audio):
         resampled_chunk = to_gpu_queue.get()
         if resampled_chunk is None:
             break
-        vocals_chunk_resampled, _ = predictor.predict(resampled_chunk)
-        from_gpu_queue.put(vocals_chunk_resampled)
+        # undo later
+        try:
+            logger.info(f"Source separation: processing chunk with {resampled_chunk.shape[0]} samples")
+            vocals_chunk_resampled, _ = predictor.predict(resampled_chunk)
+            from_gpu_queue.put(vocals_chunk_resampled)
+            logger.info("Source separation: chunk completed")
+        except Exception as sep_err:
+            logger.error(f"Source separation failed on a chunk: {sep_err}")
+            raise
 
     from_gpu_queue.put(None)
     producer_thread.join()
@@ -232,7 +239,9 @@ def speaker_diarization(audio, dia_pipeline, device):
     if waveform_tensor.dim() == 1:
         waveform_tensor = waveform_tensor.unsqueeze(0)
 
-    segments = dia_pipeline({"waveform": waveform_tensor, "sample_rate": audio["sample_rate"]})
+    # Ensure no autograd or training buffers are created during inference
+    with torch.inference_mode():
+        segments = dia_pipeline({"waveform": waveform_tensor, "sample_rate": audio["sample_rate"]})
 
     diarize_df = pd.DataFrame(
         segments.itertracks(yield_label=True),
@@ -528,7 +537,15 @@ if __name__ == "__main__":
     vad_model = silero_vad.SileroVAD(device=device)
 
     logger.debug(" * Loading Background Noise Separation Model")
-    separator_model = separate_fast.Predictor(args=cfg["separate"]["step1"], device=device_name)
+    separator_model = separate_fast.Predictor(
+        args=cfg["separate"]["step1"], 
+        device=(SEPARATION_DEVICE if SEPARATION_DEVICE in ("cuda", "cpu") else generic_cuda_device), 
+        device_index=device_id_for_process
+    )
+    try:
+        print(f"[gpu_worker] separator ONNX providers: {separator_model.model.get_providers()}")
+    except Exception:
+        pass
 
     logger.debug(" * Loading DNSMOS Scoring Model")
     dnsmos_model = dnsmos.ComputeScore(cfg["mos_model"]["primary_model_path"], device_name)
