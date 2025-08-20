@@ -9,9 +9,10 @@ RUN apt-get update -qq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# Boto3 used to interact with S3 and R2
 RUN pip install boto3
 
-# Install AWS CLI
+# Install AWS CLI (used to upload to S3)
 RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
     unzip awscliv2.zip && \
     ./aws/install && \
@@ -29,10 +30,6 @@ WORKDIR /workspace
 # Copy requirements and install all conda envs
 COPY requirements.txt .
 COPY Emilia/env.sh Emilia/env.sh
-#RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
-#    /opt/conda/bin/conda run -n AudioPipeline pip install -r requirements.txt && \
-#    /opt/conda/bin/conda run -n AudioPipeline bash -c "cd Emilia && bash env.sh"
-
 RUN /opt/conda/bin/conda create -n AudioPipeline python=3.9 -y && \
     /opt/conda/bin/conda install -n AudioPipeline -y ffmpeg && \
     /opt/conda/bin/conda install -n AudioPipeline -c pytorch -c nvidia -y \
@@ -45,7 +42,7 @@ RUN /opt/conda/bin/conda run -n AudioPipeline pip uninstall -y onnxruntime onnxr
     /opt/conda/bin/conda run -n AudioPipeline pip install --no-cache-dir onnxruntime-gpu==1.19.2 && \
     /opt/conda/bin/conda run -n AudioPipeline python -c "import onnxruntime as ort; provs=ort.get_available_providers(); print('onnxruntime providers:', provs); assert 'CUDAExecutionProvider' in provs, provs"
 
-
+# Now copy the rest of the workspace
 COPY . .
 
 # Cache models

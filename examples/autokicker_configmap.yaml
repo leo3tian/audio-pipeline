@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autokicker-code
+data:
+  autokicker.py: |
+    #!/usr/bin/env python3
+    import argparse, sys, time, signal
+    from kubernetes import client, config
+    from kubernetes.client import ApiException
+    def read_deploy(apps, ns, name):
+        try:
+            d = apps.read_namespaced_deployment(name, ns)
+            spec = int(d.spec.replicas or 0)
+            ready = int(d.status.ready_replicas or 0)
+            return spec, ready
+        except ApiException as e:
+            print(f"[err] read deploy: {e.reason} {e.body}", file=sys.stderr); return None, None
+    def patch_scale(apps, ns, name, replicas):
+        try:
+            apps.patch_namespaced_deployment_scale(name, ns, {"spec":{"replicas": int(replicas)}})
+            print(f"[ok] scale {name} -> {replicas}")
+        except ApiException as e:
+            print(f"[err] patch scale: {e.reason} {e.body}", file=sys.stderr)
+    def count_pending_other(core, ns, exclude_key, exclude_val):
+        pods = core.list_namespaced_pod(ns, field_selector="status.phase=Pending").items
+        return sum(1 for p in pods if (p.metadata.labels or {}).get(exclude_key) != exclude_val)
+    def main():
+        import os
+        ns        = os.environ["NAMESPACE"]
+        deploy    = os.environ["TARGET_DEPLOYMENT"]
+        selector  = os.environ["OUR_SELECTOR"]
+        buffer_n  = int(os.environ.get("BUFFER", "1"))
+        interval  = int(os.environ.get("INTERVAL", "15"))
+        baseline  = int(os.environ.get("BASELINE", "0"))
+        maxrep    = int(os.environ.get("MAX_REPLICAS", "0"))
+        excl_key  = os.environ.get("EXCLUDE_LABEL", "lowprio")
+        excl_val  = os.environ.get("EXCLUDE_VALUE", "true")
+
+        config.load_incluster_config()
+        core, apps = client.CoreV1Api(), client.AppsV1Api()
+
+        def on_exit(*_):
+            if os.environ.get("RESTORE_ON_EXIT","false").lower() == "true":
+                spec, _ = read_deploy(apps, ns, deploy)
+                if spec is not None and spec != baseline:
+                    print("[info] restoring baseline on exit…")
+                    patch_scale(apps, ns, deploy, baseline)
+            sys.exit(0)
+        signal.signal(signal.SIGINT, on_exit)
+        signal.signal(signal.SIGTERM, on_exit)
+
+        print(f"[start] ns={ns} deploy={deploy} buffer={buffer_n} interval={interval}s")
+        print(f"[rule] others Pending → replicas={baseline}; else → replicas=ready+{buffer_n} (keep {buffer_n} Pending)")
+
+        while True:
+            try:
+                if count_pending_other(core, ns, excl_key, excl_val) > 0:
+                    spec, ready = read_deploy(apps, ns, deploy)
+                    target = baseline
+                    if spec is not None and spec != target:
+                        print(f"[action] others pending → scale to {target}")
+                        patch_scale(apps, ns, deploy, target)
+                    else:
+                        print(f"[noop] others pending; replicas={spec}")
+                    time.sleep(interval); continue
+
+                spec, ready = read_deploy(apps, ns, deploy)
+                if spec is None:
+                    time.sleep(interval); continue
+                target = max(ready + buffer_n, 0)
+                if maxrep > 0: target = min(target, maxrep)
+                if target != spec:
+                    print(f"[action] ready={ready} → target={target}")
+                    patch_scale(apps, ns, deploy, target)
+                else:
+                    print(f"[noop] ready={ready}, replicas={spec}")
+            except Exception as e:
+                print(f"[err] {e}", file=sys.stderr)
+            time.sleep(interval)
+    if __name__ == "__main__":
+        main()

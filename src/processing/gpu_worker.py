@@ -22,7 +22,10 @@ if S3_BUCKET is None:
 S3_RAW_AUDIO_PREFIX = os.environ.get("RAW_AUDIO_PREFIX", "raw_audio/")
 S3_PROCESSED_PREFIX = os.environ.get("PROCESSED_PREFIX", "processed/")
 S3_TASKS_BASE_PREFIX = os.environ.get("TASKS_BASE_PREFIX", "tasks/")
-EMILIA_CONFIG_PATH = "Emilia/config.json"
+# Resolve Emilia path from repo root to avoid CWD issues
+REPO_ROOT = Path(__file__).resolve().parents[2]
+EMILIA_DIR = REPO_ROOT / "Emilia"
+EMILIA_CONFIG_PATH = str(EMILIA_DIR / "config.json")
 WORKERS_PER_GPU = int(os.environ.get("WORKERS_PER_GPU", 1))
 MAX_GPUS = int(os.environ.get("MAX_GPUS", 999))
 
@@ -144,7 +147,7 @@ def processing_worker(rank: int, assigned_gpu_id: str):
     import torch
     from pyannote.audio import Pipeline
     
-    emilia_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'Emilia'))
+    emilia_path = os.environ.get("EMILIA_PATH") or str(EMILIA_DIR)
     if emilia_path not in sys.path:
         sys.path.insert(0, emilia_path)
         

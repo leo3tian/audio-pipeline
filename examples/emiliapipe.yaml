@@ -1,0 +1,54 @@
+# Example Kubernetes Deployment for step 2, configured for H100s
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: emilia-pipeline
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: emilia-pipeline } }
+  template:
+    metadata:
+      labels:
+        app: emilia-pipeline
+        lowprio: "true" # This is used by the autokicker to identify nodes for eviction (see autokicker.yaml)
+    spec:
+      containers:
+      - name: worker
+        image: leofixie/gpu-worker:latest # Replace this with actual image name
+        env:
+        - { name: WORKER_BUCKET, value: "youtube-dataset-west" }
+        - { name: BATCH_SIZE, value: "40" }
+        - { name: WORKERS_PER_GPU, value: "3" }
+        - { name: AWS_REGION, value: "us-west-1" }
+        - { name: ORT_CUDA_MEM_LIMIT_GB, value: "26" }
+        - { name: ORT_CUDNN_CONV_ALGO_SEARCH, value: "DEFAULT" }
+        - { name: ORT_CUDA_ARENA_EXTEND_STRATEGY, value: "kNextPowerOfTwo" }
+        - { name: ORT_CUDNN_USE_MAX_WORKSPACE, value: "1" }
+        - { name: SEPARATION_CHUNKS, value: "18" }
+        - { name: ORT_LOG_SEVERITY_LEVEL, value: "0" }
+        - { name: SEPARATION_DEVICE, value: "cuda" }
+        - { name: DNSMOS_DEVICE, value: "cuda" }
+        - { name: R2_BUCKET, value: "podcastindex-dataset" }
+# Preferred: set these environment variables via Kubernetes secrets; but you can also set them here
+        - { name: R2_ENDPOINT_URL, value: "..." }
+        - { name: R2_ACCESS_KEY_ID, value: "..." }
+        - { name: R2_SECRET_ACCESS_KEY, value: "..." }
+        - { name: AWS_ACCESS_KEY_ID, value: "..." }
+        - { name: AWS_SECRET_ACCESS_KEY, value: "..." }
+        - { name: HF_TOKEN, value: "..." }
+        command: ["bash","-lc"]
+        args:
+        - |
+          source /opt/conda/etc/profile.d/conda.sh
+          conda activate AudioPipeline
+          trap "aws s3 cp out.log s3://$WORKER_BUCKET/logs/gpu_worker-$(date +%s).log" EXIT
+          python -u src/processing/gpu_worker.py 2>&1 | tee out.log
+        resources:
+          requests: { nvidia.com/gpu: 8, nvidia.com/hostdev: 8, cpu: "32", memory: "512Gi" }
+          limits:   { nvidia.com/gpu: 8, nvidia.com/hostdev: 8, cpu: "32", memory: "512Gi" }
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+      volumes:
+      - name: data-volume
+        emptyDir: {}

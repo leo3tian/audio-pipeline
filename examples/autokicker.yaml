@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autokicker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: autokicker
+  template:
+    metadata:
+      labels:
+        app: autokicker
+    spec:
+      serviceAccountName: leo # Replace with your service account name
+      containers:
+      - name: controller
+        image: python:3.11-slim
+        command: ["/bin/sh","-lc"]
+        args:
+          - |
+            set -e
+            python -m pip install --no-cache-dir kubernetes
+            exec python -u /app/autokicker.py
+        env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: TARGET_DEPLOYMENT
+          value: "leo-emilia-pipeline"  # Replace with the deployment name that you want to evict
+        - name: OUR_SELECTOR
+          value: "app=emilia-pipeline,lowprio=true" # Replace with the selector that you want to evict
+        - name: BUFFER
+          value: "1"
+        - name: BASELINE
+          value: "0"
+        - name: INTERVAL
+          value: "15"
+        - name: EXCLUDE_LABEL
+          value: "lowprio"     # Replace with the label that you want to exclude
+        - name: EXCLUDE_VALUE
+          value: "true"
+        - name: RESTORE_ON_EXIT
+          value: "true"
+        volumeMounts:
+        - name: code
+          mountPath: /app
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: code
+        configMap:
+          name: autokicker-code   # This points to autokicker_configmap.yaml
+          defaultMode: 0444

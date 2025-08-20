@@ -1,6 +1,7 @@
 # cache_models.py
 # This script is run once during the Docker build process to pre-download
-# and cache models from Torch Hub, preventing race conditions at runtime.
+# and cache models from Torch Hub, preventing race conditions (where all workers
+# try to download the same model at the same time) at runtime.
 
 import torch
 
