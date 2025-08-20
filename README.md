@@ -86,7 +86,9 @@ export MAX_GPUS=8
 
 **Kubernetes is the preferred way to run.** Check out /examples/:
 - `emiliapipe.yaml` starts a kubernetes deployment that runs the GPU processing script (designed for H100s but tunable)
-- `autokicker.yaml` starts a kubernetes deployment that monitors the emiliapipe deployment, kicking off emiliapipe pods when other pods are waiting to run. 
+- `autokicker.yaml` is a kubernetes deployment for monitors the emiliapipe deployment and letting other jobs run first, before . It was made to kick off emiliapipe pods when other pods need to run, so other team members can use GPUs without being blocked by the emiliapipe jobs. This is working as intended when:
+    - There are no emiliapipe pods when other pods are pending
+    - Otherwise, there should always be any amount of emiliapipe pods running and exactly one emiliapipe pod pending (this pending pod is how the script knows when to stop adding emiliapipe pods)
 
 Run on a GPU node (may be deprecated):
 ```bash
