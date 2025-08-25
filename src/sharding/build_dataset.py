@@ -1,8 +1,8 @@
 import os
 import json
 import boto3
-import tempfile
-import itertools
+import argparse
+import concurrent.futures
 from datasets import Dataset, Features, Audio, Value
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -22,14 +22,15 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 
 # --- Batching and Concurrency Controls ---
 # How many podcast episodes to process in one go before creating a shard and uploading.
-# Tune this based on your tinybox's RAM. 1000 is a safe starting point.
+# With 128GB RAM, you can use a large chunk size for more efficient commits.
 EPISODES_PER_CHUNK = int(os.environ.get("EPISODES_PER_CHUNK", "1000"))
+# Number of parallel threads to fetch data from R2.
+DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "4"))
 
-# File to track which chunks we've already processed
+
+# --- File Paths for State Management ---
 PROGRESS_LOG = "src/sharding/progress.log"
-
-# Global client placeholder (avoid storing actual client in module globals)
-r2_client = None
+WORK_PLAN_FILE = "src/sharding/work_plan.json"
 
 
 # --- 2. R2 Client and Helper Functions ---
@@ -67,37 +68,55 @@ def _normalize_language_code(lang_str):
     base_code = code.split('-')[0].split('_')[0]
     return base_code
 
-def list_all_episode_prefixes_by_language(r2_client, limit_per_lang=None):
+def list_all_episode_prefixes_by_language(r2_client, limit_per_lang=None, max_languages=None):
     """
-    Efficiently lists all unique episode prefixes from R2 and groups them by language.
-    Returns a dictionary like: {'en': ['path/to/en/ep1', ...], 'es': ['path/to/es/ep1', ...]}
+    Efficiently lists unique episode prefixes from R2 grouped by normalized base language.
+    Parallelizes episode listing per language to speed up scanning.
     """
-    print("Listing all episode prefixes from R2 by language...")
+    print("Listing all episode prefixes from R2 by language (parallel)...")
     prefixes_by_lang = {}
     paginator = r2_client.get_paginator('list_objects_v2')
-    
-    # First, get all language folders (e.g., 'processed/en/')
+
+    # 1) List language folders (e.g., 'processed/en/')
     lang_pages = paginator.paginate(Bucket=R2_BUCKET, Prefix="processed/", Delimiter='/')
-    
+    language_entries = []  # [(normalized_language, lang_prefix)]
     for page in lang_pages:
         for lang_prefix_data in page.get('CommonPrefixes', []):
             lang_prefix = lang_prefix_data.get('Prefix')
-            # Extract language code, e.g., 'en' from 'processed/en/'
             raw_language = lang_prefix.strip('/').split('/')[-1]
             normalized_language = _normalize_language_code(raw_language)
+            language_entries.append((normalized_language, lang_prefix))
 
-            # Now, for each language, get all episode folders
-            ep_pages = paginator.paginate(Bucket=R2_BUCKET, Prefix=lang_prefix, Delimiter='/')
+    # Optionally cap number of languages for testing
+    if max_languages is not None:
+        language_entries = language_entries[:max_languages]
+
+    # 2) Scan each language in parallel
+    import concurrent.futures
+
+    def scan_one_language(entry):
+        normalized_language, lang_prefix = entry
+        client = get_r2_client()
+        collected = []
+        try:
+            ep_pages = client.get_paginator('list_objects_v2').paginate(
+                Bucket=R2_BUCKET, Prefix=lang_prefix, Delimiter='/'
+            )
             for ep_page in ep_pages:
                 for ep_prefix in ep_page.get('CommonPrefixes', []):
-                    # Use setdefault to initialize the list if the key is new
-                    prefixes_by_lang.setdefault(normalized_language, []).append(ep_prefix.get('Prefix'))
+                    collected.append(ep_prefix.get('Prefix'))
+                    if limit_per_lang and len(collected) >= limit_per_lang:
+                        return normalized_language, collected
+        except Exception as e:
+            print(f"  [scan] Warning: failed scanning language '{normalized_language}' at '{lang_prefix}': {e}")
+        return normalized_language, collected
 
-    # After aggregating, apply the limit if one was provided
-    if limit_per_lang:
-        print(f"Applying limit of {limit_per_lang} episodes per language for testing.")
-        for lang in prefixes_by_lang:
-            prefixes_by_lang[lang] = prefixes_by_lang[lang][:limit_per_lang]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        for normalized_language, collected in executor.map(scan_one_language, language_entries):
+            if not collected:
+                continue
+            existing = prefixes_by_lang.setdefault(normalized_language, [])
+            existing.extend(collected)
 
     for lang, prefixes in prefixes_by_lang.items():
         print(f"  Found {len(prefixes)} episodes for language: '{lang}'")
@@ -118,51 +137,49 @@ def mark_chunk_as_completed(chunk_id):
         f.write(f"{chunk_id}\n")
 
 
-# --- 3. The Data Generator ---
-# This is the memory-efficient core of the script.
+# --- 3. Parallel Data Fetching ---
 
-def generate_examples(episode_prefixes):
+def fetch_episode_data(prefix):
     """
-    A Python generator that yields one processed example at a time.
-    It streams data directly from R2, processes it, and yields.
-    This avoids loading the entire dataset into RAM.
+    Fetches all data for a single episode (metadata and all audio segments).
+    This function is designed to be run in a thread pool.
     """
-    client = get_r2_client()
-    for prefix in episode_prefixes:
-        try:
-            # 1. Get the metadata for this episode
-            metadata_key = f"{prefix}all_segments.json"
-            metadata_obj = client.get_object(Bucket=R2_BUCKET, Key=metadata_key)
-            segments = json.loads(metadata_obj['Body'].read())
+    # Each thread needs its own client.
+    thread_local_client = get_r2_client()
+    examples = []
+    try:
+        # 1. Get the metadata for this episode
+        metadata_key = f"{prefix}all_segments.json"
+        metadata_obj = thread_local_client.get_object(Bucket=R2_BUCKET, Key=metadata_key)
+        segments = json.loads(metadata_obj['Body'].read())
 
-            # 2. For each segment, get the audio and yield a structured record
-            for i, segment in enumerate(segments):
-                # Correctly handle episode ID extraction from prefix
-                episode_id = prefix.strip('/').split('/')[-1]
-                audio_filename = f"{episode_id}_{i:06d}.mp3"
-                audio_key = f"{prefix}{audio_filename}"
+        # 2. For each segment, get the audio and create a structured record
+        for i, segment in enumerate(segments):
+            episode_id = prefix.strip('/').split('/')[-1]
+            audio_filename = f"{episode_id}_{i:06d}.mp3"
+            audio_key = f"{prefix}{audio_filename}"
 
-                audio_obj = client.get_object(Bucket=R2_BUCKET, Key=audio_key)
-                audio_bytes = audio_obj['Body'].read()
+            audio_obj = thread_local_client.get_object(Bucket=R2_BUCKET, Key=audio_key)
+            audio_bytes = audio_obj['Body'].read()
 
-                yield {
-                    "audio": {"path": audio_key, "bytes": audio_bytes},
-                    "text": segment.get("text", ""),
-                    "speaker_id": segment.get("speaker", "UNKNOWN"),
-                    "duration_seconds": segment.get("end", 0) - segment.get("start", 0),
-                    "dnsmos": segment.get("dnsmos", 0.0),
-                    "language": segment.get("language", "UNKNOWN"),
-                }
-        except ClientError as e:
-            if e.response.get("Error", {}).get("Code") == "NoSuchKey":
-                print(f"Warning: Skipping prefix {prefix} due to missing file: {e}")
-                continue
-            # For other AWS errors, print and continue
-            print(f"Warning: Boto3 ClientError on prefix {prefix}: {e}")
-            continue
-        except Exception as e:
-            print(f"Error processing prefix {prefix}: {e}")
-            continue
+            examples.append({
+                "audio": {"path": audio_key, "bytes": audio_bytes},
+                "text": segment.get("text", ""),
+                "speaker_id": segment.get("speaker", "UNKNOWN"),
+                "duration_seconds": segment.get("end", 0) - segment.get("start", 0),
+                "dnsmos": segment.get("dnsmos", 0.0),
+                "language": segment.get("language", "UNKNOWN"),
+            })
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "NoSuchKey":
+            print(f"Warning: Skipping prefix {prefix} due to missing file: {e}")
+            return [] # Return empty list on expected errors
+        print(f"Warning: Boto3 ClientError on prefix {prefix}: {e}")
+        return []
+    except Exception as e:
+        print(f"Error processing prefix {prefix}: {e}")
+        return [] # Ensure we always return a list
+    return examples
 
 
 # --- 4. Main Orchestration Logic ---
@@ -170,17 +187,37 @@ def generate_examples(episode_prefixes):
 def main():
     """
     Main function to orchestrate the sharding and uploading process.
+    Handles two modes: --scan and process.
     """
-    # Create the directory for the progress log if it doesn't exist
-    os.makedirs(os.path.dirname(PROGRESS_LOG), exist_ok=True)
-    
-    # Create a local client for listing prefixes; avoid storing in module globals
-    r2_client = get_r2_client()
-    completed_chunks = load_completed_chunks()
+    parser = argparse.ArgumentParser(description="Build and upload a Hugging Face dataset from R2.")
+    parser.add_argument("--scan", action="store_true", help="Scan R2 and create a work plan. Run this once.")
+    args = parser.parse_args()
 
-    # Get the full list of work to be done, grouped by language
-    # FOR TESTING: Only process the first 1 episode per language. Remove `limit_per_lang=1` for a full run.
-    prefixes_by_lang = list_all_episode_prefixes_by_language(r2_client, limit_per_lang=1)
+    # Create the directory for state files if it doesn't exist
+    os.makedirs(os.path.dirname(PROGRESS_LOG), exist_ok=True)
+
+    if args.scan:
+        print("--- Scan Mode ---")
+        # FOR TESTING: Limit the scan to a small number of episodes per language.
+        # Remove `limit_per_lang=10` for the full run.
+        print("NOTE: Applying test limit of 10 episodes per language.")
+        r2_client = get_r2_client()
+        prefixes_by_lang = list_all_episode_prefixes_by_language(r2_client, limit_per_lang=10)
+        with open(WORK_PLAN_FILE, 'w') as f:
+            json.dump(prefixes_by_lang, f, indent=2)
+        print(f"✅ Scan complete. Work plan saved to {WORK_PLAN_FILE}")
+        return
+
+    print("--- Process Mode ---")
+    if not os.path.exists(WORK_PLAN_FILE):
+        print(f"Error: Work plan '{WORK_PLAN_FILE}' not found.")
+        print("Please run the script with the --scan flag first.")
+        return
+
+    with open(WORK_PLAN_FILE, 'r') as f:
+        prefixes_by_lang = json.load(f)
+    
+    completed_chunks = load_completed_chunks()
 
     # Define the structure of our final dataset
     features = Features({
@@ -201,39 +238,58 @@ def main():
             all_prefixes[i:i + EPISODES_PER_CHUNK] 
             for i in range(0, len(all_prefixes), EPISODES_PER_CHUNK)
         ]
-
         print(f"Split '{language}' into {len(prefix_chunks)} chunks of up to {EPISODES_PER_CHUNK} episodes each.")
 
         # Process each chunk for the current language
-        for i, chunk in enumerate(prefix_chunks):
+        for i, chunk_of_prefixes in enumerate(prefix_chunks):
             chunk_id = f"{language}-{i}"
             if chunk_id in completed_chunks:
                 print(f"--- Skipping already completed chunk {chunk_id} ({i+1}/{len(prefix_chunks)}) ---")
                 continue
 
-            print(f"--- Processing chunk {chunk_id} ({i+1}/{len(prefix_chunks)}) ---")
+            print(f"--- Processing chunk {chunk_id} ({i+1}/{len(prefix_chunks)}) with {len(chunk_of_prefixes)} episodes ---")
             
-            # Use the generator to create a Dataset object for this chunk
-            dataset_chunk = Dataset.from_generator(
-                generate_examples,
-                features=features,
-                gen_kwargs={"episode_prefixes": chunk},
-            )
+            all_examples_for_chunk = []
+            # Use ThreadPoolExecutor for high-performance parallel downloads
+            with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+                # Submit all fetch jobs to the pool
+                future_to_prefix = {executor.submit(fetch_episode_data, prefix): prefix for prefix in chunk_of_prefixes}
+                
+                for future in concurrent.futures.as_completed(future_to_prefix):
+                    # The result of fetch_episode_data is a list of examples
+                    examples = future.result()
+                    if examples:
+                        all_examples_for_chunk.extend(examples)
             
-            print(f"Generated dataset for chunk {chunk_id} with {len(dataset_chunk)} segments.")
+            if not all_examples_for_chunk:
+                print(f"Warning: No valid segments found for chunk {chunk_id}. Skipping.")
+                # Mark as complete even if empty to avoid reprocessing a known-bad chunk
+                mark_chunk_as_completed(chunk_id)
+                continue
+
+            print(f"Generated dataset for chunk {chunk_id} with {len(all_examples_for_chunk)} segments.")
+            
+            # Create the dataset object from the in-memory list of examples
+            dataset_chunk = Dataset.from_list(all_examples_for_chunk, features=features)
 
             # Push this chunk to the Hugging Face Hub under the language-specific config
             print(f"Uploading chunk {chunk_id} to {HF_REPO_ID} (config: {language})...")
-            dataset_chunk.push_to_hub(
-                repo_id=HF_REPO_ID,
-                config_name=language, # This is the key change!
-                token=HF_TOKEN,
-                commit_message=f"Add data chunk {i+1}/{len(prefix_chunks)} for lang '{language}'"
-            )
-            
-            # Mark as complete and move to the next
-            mark_chunk_as_completed(chunk_id)
-            print(f"--- Successfully completed chunk {chunk_id} ---")
+            try:
+                dataset_chunk.push_to_hub(
+                    repo_id=HF_REPO_ID,
+                    config_name=language,
+                    token=HF_TOKEN,
+                    commit_message=f"Add data chunk {i+1}/{len(prefix_chunks)} for lang '{language}'"
+                )
+                # If and only if the upload succeeds, mark the chunk as complete.
+                mark_chunk_as_completed(chunk_id)
+                print(f"--- Successfully completed and uploaded chunk {chunk_id} ---")
+            except Exception as e:
+                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                print(f"CRITICAL: Failed to upload chunk {chunk_id}. Error: {e}")
+                print(f"This chunk will be retried on the next run.")
+                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
 
     print("✅ All languages and chunks have been processed and uploaded!")
 
@@ -245,8 +301,15 @@ if __name__ == "__main__":
     # Basic check for required environment variables
     required_vars = ["R2_BUCKET", "R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "HF_REPO_ID", "HF_TOKEN"]
     if any(v not in os.environ for v in required_vars):
-        print("Error: Missing one or more required environment variables.")
-        print("Please set: R2_BUCKET, R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, HF_REPO_ID, HF_TOKEN")
-        exit(1)
+        # Allow scan mode without HF token
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--scan", action="store_true")
+        args, _ = parser.parse_known_args()
+        if not args.scan and "HF_TOKEN" not in os.environ:
+             print("Error: Missing HF_TOKEN for process mode.")
+             exit(1)
+        elif any(v not in os.environ for v in required_vars if v != "HF_TOKEN"):
+            print("Error: Missing one or more required R2 environment variables.")
+            exit(1)
 
     main()
