@@ -17,11 +17,10 @@ import uuid
 import random
 from urllib.parse import quote
 
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-except Exception as _e:  # pragma: no cover
-    raise RuntimeError("pyarrow is required for Parquet streaming. Please `pip install pyarrow`.") from _e
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 
 from huggingface_hub import HfApi, CommitOperationAdd
 load_dotenv()
@@ -440,6 +439,7 @@ def main():
     parser.add_argument("--max-rows-per-shard", type=int, default=MAX_ROWS_PER_SHARD, help="Max rows per Parquet shard.")
     parser.add_argument("--write-batch-rows", type=int, default=WRITE_BATCH_ROWS, help="Rows per Parquet write batch.")
     parser.add_argument("--download-workers", type=int, default=DOWNLOAD_WORKERS, help="Parallel metadata fetch workers.")
+    parser.add_argument("--languages", type=str, default="", help="Comma-separated languages to process (e.g., 'en,de,ja'). Empty = all.")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(PROGRESS_LOG), exist_ok=True)
@@ -467,6 +467,18 @@ def main():
     with gzip.open(WORK_PLAN_FILE, 'rt', encoding='utf-8') as f:
         prefixes_by_lang = json.load(f)
     print(f"[proc] Languages in plan: {len(prefixes_by_lang)}")
+
+    if args.languages:
+        requested = {
+            _normalize_language_code(lang.strip())
+            for lang in args.languages.split(",") if lang.strip()
+        }
+        if requested:
+            prefixes_by_lang = {
+                lang: prefixes for lang, prefixes in prefixes_by_lang.items()
+                if _normalize_language_code(lang) in requested
+            }
+            print(f"[proc] Filtered to languages: {sorted(prefixes_by_lang.keys())}")
     
     completed_chunks = load_completed_chunks()
     print(f"[proc] Completed chunks in log: {len(completed_chunks)}")
