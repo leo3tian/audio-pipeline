@@ -1,4 +1,4 @@
-# Example Kubernetes Deployment for step 2, configured for H100s
+# Example Kubernetes Deployment for processing step, configured for H100s
 apiVersion: apps/v1
 kind: Deployment
 metadata:

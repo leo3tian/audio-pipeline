@@ -7,7 +7,7 @@ import argparse
 import concurrent.futures
 import time
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
 import boto3
 from botocore.config import Config
@@ -115,7 +115,7 @@ def _normalize_language_code(lang_str):
     base_code = code.split('-')[0].split('_')[0]
     return base_code
 
-def list_all_episode_prefixes_by_language(r2_client, limit_per_lang: Optional[int] = None, max_languages: Optional[int] = None):
+def list_all_episode_prefixes_by_language(r2_client, limit_per_lang: Optional[int] = None, max_languages: Optional[int] = None, only_languages: Optional[Set[str]] = None):
     """
     Efficiently lists unique episode prefixes from R2 grouped by normalized base language.
     Parallelizes episode listing per language to speed up scanning.
@@ -139,6 +139,10 @@ def list_all_episode_prefixes_by_language(r2_client, limit_per_lang: Optional[in
             raw_language = lang_prefix.strip('/').split('/')[-1]
             normalized_language = _normalize_language_code(raw_language)
             language_entries.append((normalized_language, lang_prefix))
+    if only_languages:
+        before = len(language_entries)
+        language_entries = [entry for entry in language_entries if entry[0] in only_languages]
+        print(f"[scan] Filtered languages {before} -> {len(language_entries)} using only_languages={sorted(only_languages)}")
     print(f"[scan] Total languages discovered: {len(language_entries)}")
 
     # Optionally cap number of languages for testing
@@ -177,7 +181,7 @@ def list_all_episode_prefixes_by_language(r2_client, limit_per_lang: Optional[in
 
     print(f"[scan] Starting parallel episode listing across {len(language_entries)} languages ...")
     t_lang = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
         for idx, (normalized_language, collected) in enumerate(executor.map(scan_one_language, language_entries), start=1):
             if idx % 5 == 0:
                 print(f"[scan] progress: {idx}/{len(language_entries)} languages scanned")
@@ -449,7 +453,18 @@ def main():
         r2_client = R2_CLIENT
         limit = None if args.limit_per_lang <= 0 else args.limit_per_lang
         max_langs = None if args.max_languages <= 0 else args.max_languages
-        prefixes_by_lang = list_all_episode_prefixes_by_language(r2_client, limit_per_lang=limit, max_languages=max_langs)
+        only_langs: Optional[Set[str]] = None
+        if args.languages:
+            only_langs = {
+                _normalize_language_code(lang.strip())
+                for lang in args.languages.split(",") if lang.strip()
+            }
+        prefixes_by_lang = list_all_episode_prefixes_by_language(
+            r2_client,
+            limit_per_lang=limit,
+            max_languages=max_langs,
+            only_languages=only_langs,
+        )
         print("[scan] Writing work plan (gz) to disk ...")
         os.makedirs(os.path.dirname(WORK_PLAN_FILE), exist_ok=True)
         with gzip.open(WORK_PLAN_FILE, 'wt', encoding='utf-8') as f:

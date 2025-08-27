@@ -1,0 +1,23 @@
+name = "hf-shard-worker"
+main = "src/worker.ts"
+compatibility_date = "2024-08-20"
+
+[[r2_buckets]]
+binding = "R2"
+# Replace with your actual R2 bucket name
+bucket_name = "podcastindex-dataset"
+
+[[queues.consumers]]
+# Replace with your actual Queue name
+queue = "huggingface-upload"
+max_batch_size = 1
+max_batch_timeout = 30
+
+[vars]
+HF_REPO_ID = "leo-fixie/pi-test-3"
+R2_BUCKET_NAME = "podcastindex-dataset"
+# Caps per message to keep under Worker limits (tune as needed)
+MAX_BYTES_PER_SHARD = "1000000000" # 1 GB cap per shard
+INWORKER_CONCURRENCY = "4"        # parallel uploads inside a message
+
+

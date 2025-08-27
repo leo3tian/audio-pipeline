@@ -1,10 +1,11 @@
 {
     "language": {
         "multilingual": false,
-	"hotwords": false,
+	    "hotwords": false,
         "supported": [
             "zh",
             "en",
+            "es",
             "fr",
             "ja",
             "ko",
