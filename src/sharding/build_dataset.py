@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 
 
 from huggingface_hub import HfApi, CommitOperationAdd
+from huggingface_hub import hf_hub_url
 load_dotenv()
 
 # --- 1. Configuration ---
@@ -45,6 +46,11 @@ DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "64"))
 # Parquet shard policy (override via env or CLI flags)
 MAX_ROWS_PER_SHARD = int(os.environ.get("MAX_ROWS_PER_SHARD", "250000"))
 WRITE_BATCH_ROWS = int(os.environ.get("WRITE_BATCH_ROWS", "5000"))
+
+# --- Audio mirroring (always ON) ---
+AUDIO_SHARD_MAX_BYTES = 2_000_000_000   # ~2 GB target per shard
+AUDIO_SHARD_MAX_FILES = 20_000          # safety bound on file count
+AUDIO_DOWNLOAD_WORKERS = 32             # parallel R2 -> local fetchers
 
 
 # --- File Paths for State Management ---
@@ -227,6 +233,23 @@ def _build_audio_url(key: str) -> str:
     return f"{endpoint}/{R2_BUCKET}/{path}"
 
 
+def _r2_stream_to_file(key: str, dst_path: str, tries: int = 5) -> int:
+    """Stream an R2 object to a local file; return bytes written."""
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    for i in range(tries):
+        try:
+            resp = R2_CLIENT.get_object(Bucket=R2_BUCKET, Key=key)
+            with open(dst_path, "wb") as f:
+                for chunk in resp["Body"].iter_chunks(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            return os.path.getsize(dst_path)
+        except Exception:
+            if i == tries - 1:
+                raise
+            time.sleep(min(60, 2 ** i) + random.random())
+
+
 def fetch_episode_manifest_rows(prefix: str) -> List[Dict[str, Any]]:
     """Fetches metadata for one episode and returns manifest rows without audio bytes."""
     rows: List[Dict[str, Any]] = []
@@ -346,6 +369,98 @@ class RollingParquetWriter:
             pass
 
 
+class AudioShardUploader:
+    """
+    Buffers MP3s into rotating shard folders, then uploads each folder to HF in one call.
+    Returns repo-relative paths so Parquet can point to HF CDN URLs.
+    """
+    def __init__(self, language: str, chunk_id: str):
+        self.language = language
+        self.chunk_id = chunk_id
+        self.tmp_root = tempfile.mkdtemp(prefix=f"audio_{language}_{chunk_id}_")
+        self.stage_dir = os.path.join(self.tmp_root, "_stage")
+        os.makedirs(self.stage_dir, exist_ok=True)
+        self.shard_index = 0
+        self._reset_shard()
+
+    def _reset_shard(self):
+        self.shard_dir = os.path.join(self.tmp_root, f"shard-{self.shard_index:05d}")
+        os.makedirs(self.shard_dir, exist_ok=True)
+        self.bytes_in_shard = 0
+        self.files_in_shard = 0
+
+    def _repo_prefix(self, shard_idx: int) -> str:
+        return f"audio/{self.language}/{self.chunk_id}/shard-{shard_idx:05d}"
+
+    def _upload_current_shard(self):
+        if self.files_in_shard == 0:
+            return
+        path_in_repo = self._repo_prefix(self.shard_index)
+        HF_API.upload_folder(
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            folder_path=self.shard_dir,
+            path_in_repo=path_in_repo,
+            token=HF_TOKEN,
+            allow_patterns="**/*.mp3",
+            run_as_future=False,
+        )
+        self.shard_index += 1
+        self._reset_shard()
+
+    def _maybe_rotate(self):
+        if (self.bytes_in_shard >= AUDIO_SHARD_MAX_BYTES) or (self.files_in_shard >= AUDIO_SHARD_MAX_FILES):
+            self._upload_current_shard()
+
+    def add_many(self, items: List[Tuple[str, str, int]]) -> List[str]:
+        """
+        items = list of (r2_key, episode_id, seg_idx).
+        Returns repo-relative paths in the same order as items.
+        """
+        repo_rel_paths: List[str] = []
+
+        def _download_to_stage(item):
+            r2_key, episode_id, seg_idx = item
+            stage_path = os.path.join(self.stage_dir, f"{uuid.uuid4().hex}_{episode_id}_{seg_idx:06d}.mp3")
+            _r2_stream_to_file(r2_key, stage_path)
+            # Return metadata for main-thread placement
+            return (stage_path, episode_id, seg_idx, os.path.getsize(stage_path))
+
+        # Parallel download to staging
+        with concurrent.futures.ThreadPoolExecutor(max_workers=AUDIO_DOWNLOAD_WORKERS) as ex:
+            futures = [ex.submit(_download_to_stage, it) for it in items]
+            # As they finish, move into the current shard and record repo paths
+            done_map = []
+            for fut in concurrent.futures.as_completed(futures):
+                done_map.append(fut.result())
+            # Preserve original order of 'items'
+            # Build a map from (episode_id, seg_idx) -> (stage_path, size)
+            pos = {(eid, sidx): (sp, sz) for sp, eid, sidx, sz in done_map}
+
+        # Main-thread: deterministically place files into shards in input order
+        for r2_key, episode_id, seg_idx in items:
+            stage_path, fsize = pos[(episode_id, seg_idx)]
+            dst_name = f"{episode_id}_{seg_idx:06d}.mp3"
+            dst_path = os.path.join(self.shard_dir, dst_name)
+            shutil.move(stage_path, dst_path)
+            self.bytes_in_shard += fsize
+            self.files_in_shard += 1
+            repo_rel = f"{self._repo_prefix(self.shard_index)}/{dst_name}"
+            repo_rel_paths.append(repo_rel)
+            self._maybe_rotate()
+
+        return repo_rel_paths
+
+    def finalize(self):
+        self._upload_current_shard()
+
+    def cleanup(self):
+        shutil.rmtree(self.tmp_root, ignore_errors=True)
+
+
+def _hf_url_for_repo_path(repo_path: str) -> str:
+    return hf_hub_url(repo_id=HF_REPO_ID, filename=repo_path, repo_type="dataset")
+
 def _repo_path_exists(path_in_repo: str) -> bool:
     try:
         HF_API.repo_file_info(
@@ -447,6 +562,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(PROGRESS_LOG), exist_ok=True)
+    assert WRITE_BATCH_ROWS <= MAX_ROWS_PER_SHARD, "WRITE_BATCH_ROWS must be <= MAX_ROWS_PER_SHARD"
 
     if args.scan:
         print("--- Scan Mode ---")
@@ -531,6 +647,7 @@ def main():
                 json.dump({"chunk": chunk_id, "status": "in_progress", "ts": time.time()}, sf)
 
             writer = RollingParquetWriter(language, current_chunk=chunk_id, max_rows_per_shard=args.max_rows_per_shard, write_batch_rows=args.write_batch_rows)
+            audio_uploader = AudioShardUploader(language=language, chunk_id=chunk_id)
 
             workers = min(args.download_workers, max(1, len(chunk_of_prefixes)))
             print(f"[proc:{language}] submitting {len(chunk_of_prefixes)} metadata jobs (workers={workers}) ...")
@@ -544,6 +661,19 @@ def main():
                         print(f"[proc:{language}] progress {total_done}/{len(chunk_of_prefixes)} episodes processed")
                     if not rows:
                         continue
+
+                    # Mirror audio to HF and rewrite URLs
+                    prefix = future_to_prefix[future]
+                    items = []
+                    for r in rows:
+                        episode_id = r["episode_id"]
+                        seg_idx = int(r["segment_index"])
+                        r2_key = f"{prefix}{episode_id}_{seg_idx:06d}.mp3"
+                        items.append((r2_key, episode_id, seg_idx))
+                    repo_rels = audio_uploader.add_many(items)
+                    for r, rel in zip(rows, repo_rels):
+                        r["audio_url"] = _hf_url_for_repo_path(rel)
+
                     committed_locals = writer.write_rows(rows) or []
                     rows_written += len(rows)
                     for p in committed_locals:
@@ -554,7 +684,7 @@ def main():
                         except Exception as e:
                             print(f"[cleanup] WARN failed to delete local shard {p}: {e}")
 
-            # finalize last shard for this chunk
+            # finalize last Parquet shard
             last_local = writer.finalize()
             if last_local:
                 if _commit_parquet_to_hub(last_local, language):
@@ -564,6 +694,10 @@ def main():
                 except Exception as e:
                     print(f"[cleanup] WARN failed to delete local shard {last_local}: {e}")
             writer.cleanup()
+
+            # finalize audio shards
+            audio_uploader.finalize()
+            audio_uploader.cleanup()
 
             if rows_written == 0 and shards_committed == 0:
                 print(f"[proc:{language}] WARNING: no rows for {chunk_id}; will retry later.")
