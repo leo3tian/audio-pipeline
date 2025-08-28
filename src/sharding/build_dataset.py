@@ -9,6 +9,10 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 load_dotenv()
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 # --- 1. Configuration ---
 # pip install datasets "huggingface_hub[hf_transfer]" boto3
@@ -183,20 +187,18 @@ def fetch_episode_data(prefix):
     try:
         t0 = time.time()
         metadata_key = f"{prefix}all_segments.json"
-        print(f"[fetch] meta GET {metadata_key}")
+        #print(f"[fetch] meta GET {metadata_key}")
         metadata_obj = thread_local_client.get_object(Bucket=R2_BUCKET, Key=metadata_key)
         segments = json.loads(metadata_obj['Body'].read())
-        print(f"[fetch] meta OK {metadata_key} segments={len(segments)} (+{time.time()-t0:.2f}s)")
+        #print(f"[fetch] meta OK {metadata_key} segments={len(segments)} (+{time.time()-t0:.2f}s)")
 
         for i, segment in enumerate(segments):
             episode_id = prefix.strip('/').split('/')[-1]
             audio_filename = f"{episode_id}_{i:06d}.mp3"
             audio_key = f"{prefix}{audio_filename}"
             t1 = time.time()
-            print(f"[fetch] audio GET {audio_key}")
             audio_obj = thread_local_client.get_object(Bucket=R2_BUCKET, Key=audio_key)
             audio_bytes = audio_obj['Body'].read()
-            print(f"[fetch] audio OK {audio_key} (+{time.time()-t1:.2f}s)")
 
             examples.append({
                 "audio": {"path": audio_key, "bytes": audio_bytes},
@@ -215,7 +217,7 @@ def fetch_episode_data(prefix):
     except Exception as e:
         print(f"[fetch] Error processing prefix {prefix}: {e}")
         return []
-    print(f"[fetch] DONE {prefix} total_examples={len(examples)}")
+    # print(f"[fetch] DONE {prefix} total_examples={len(examples)}")
     return examples
 
 
@@ -301,6 +303,12 @@ def main():
         ]
         print(f"[proc:{language}] chunks={len(prefix_chunks)} chunk_size<=${EPISODES_PER_CHUNK}")
 
+        # Set up a language-level progress tracker across all chunks
+        language_done = 0
+        lang_pbar = None
+        if tqdm is not None:
+            lang_pbar = tqdm(total=len(all_prefixes), desc=f"{language} episodes", mininterval=0.5)
+
         for i, chunk_of_prefixes in enumerate(prefix_chunks):
             chunk_id = f"{language}-{i}"
             if chunk_id in completed_chunks:
@@ -313,15 +321,22 @@ def main():
             all_examples_for_chunk = []
             print(f"[proc:{language}] submitting {len(chunk_of_prefixes)} fetch jobs (workers={DOWNLOAD_WORKERS}) ...")
             with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
-                future_to_prefix = {executor.submit(fetch_episode_data, prefix): prefix for prefix in chunk_of_prefixes}
-                total_done = 0
-                for future in concurrent.futures.as_completed(future_to_prefix):
-                    examples = future.result()
-                    total_done += 1
-                    if total_done % 5 == 0:
-                        print(f"[proc:{language}] progress {total_done}/{len(chunk_of_prefixes)} episodes fetched")
-                    if examples:
-                        all_examples_for_chunk.extend(examples)
+                futures = [executor.submit(fetch_episode_data, prefix) for prefix in chunk_of_prefixes]
+                if lang_pbar is not None:
+                    for future in concurrent.futures.as_completed(futures):
+                        examples = future.result()
+                        if examples:
+                            all_examples_for_chunk.extend(examples)
+                        language_done += 1
+                        lang_pbar.update(1)
+                else:
+                    for future in concurrent.futures.as_completed(futures):
+                        examples = future.result()
+                        language_done += 1
+                        if language_done % 50 == 0:
+                            print(f"[proc:{language}] progress {language_done}/{len(all_prefixes)} episodes fetched")
+                        if examples:
+                            all_examples_for_chunk.extend(examples)
             print(f"[proc:{language}] fetch complete ({len(all_examples_for_chunk)} segments) in {time.time()-t_chunk:.2f}s")
             
             if not all_examples_for_chunk:
@@ -346,6 +361,9 @@ def main():
             except Exception as e:
                 print(f"[proc:{language}] ERROR uploading {chunk_id}: {e}")
                 print(f"[proc:{language}] Will retry this chunk on next run.")
+
+        if lang_pbar is not None:
+            lang_pbar.close()
 
     print("✅ All languages and chunks have been processed and uploaded!")
 
