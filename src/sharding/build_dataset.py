@@ -13,6 +13,8 @@ try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
+from huggingface_hub import HfApi, CommitOperationAdd
+import tempfile
 
 # --- 1. Configuration ---
 # pip install datasets "huggingface_hub[hf_transfer]" boto3
@@ -28,9 +30,9 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 # --- Batching and Concurrency Controls ---
 # How many podcast episodes to process in one go before creating a shard and uploading.
 # With 128GB RAM, you can use a large chunk size for more efficient commits.
-EPISODES_PER_CHUNK = int(os.environ.get("EPISODES_PER_CHUNK", "20000"))
+EPISODES_PER_CHUNK = int(os.environ.get("EPISODES_PER_CHUNK", "500"))
 # Number of parallel threads to fetch data from R2.
-DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "64"))
+DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "128"))
 
 
 # --- File Paths for State Management ---
@@ -347,15 +349,33 @@ def main():
             print(f"[proc:{language}] building HF dataset object ...")
             dataset_chunk = Dataset.from_list(all_examples_for_chunk, features=features)
 
-            print(f"[proc:{language}] uploading chunk {chunk_id} to {HF_REPO_ID} (config={language}) ...")
+            # Append-only upload via create_commit: write a Parquet shard per chunk
+            repo_path = f"data/{language}/chunk-{i:05d}.parquet"
+            print(f"[proc:{language}] uploading chunk {chunk_id} to {HF_REPO_ID} at '{repo_path}' (append-only) ...")
             try:
                 t_up = time.time()
-                dataset_chunk.push_to_hub(
-                    repo_id=HF_REPO_ID,
-                    config_name=language,
-                    token=HF_TOKEN,
-                    commit_message=f"Add data chunk {i+1}/{len(prefix_chunks)} for lang '{language}'"
-                )
+                with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmpf:
+                    tmp_path = tmpf.name
+                try:
+                    dataset_chunk.to_parquet(tmp_path)
+                    api = HfApi()
+                    api.create_commit(
+                        repo_id=HF_REPO_ID,
+                        repo_type="dataset",
+                        operations=[
+                            CommitOperationAdd(
+                                path_in_repo=repo_path,
+                                path_or_fileobj=tmp_path,
+                            )
+                        ],
+                        commit_message=f"Append data chunk {i+1}/{len(prefix_chunks)} for lang '{language}'",
+                        token=HF_TOKEN,
+                    )
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
                 mark_chunk_as_completed(chunk_id)
                 print(f"[proc:{language}] DONE {chunk_id} upload in {time.time()-t_up:.2f}s (total {time.time()-t_chunk:.2f}s)")
             except Exception as e:
