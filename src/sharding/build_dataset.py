@@ -30,8 +30,8 @@ DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "64"))
 
 
 # --- File Paths for State Management ---
-PROGRESS_LOG = "progress.log"
-WORK_PLAN_FILE = "work_plan.json"
+PROGRESS_LOG = "../progress.log"
+WORK_PLAN_FILE = "../work_plan.json"
 
 
 # --- 2. R2 Client and Helper Functions ---
@@ -69,13 +69,20 @@ def _normalize_language_code(lang_str):
     base_code = code.split('-')[0].split('_')[0]
     return base_code
 
-def list_all_episode_prefixes_by_language(r2_client, limit_per_lang=None, max_languages=None):
+def list_all_episode_prefixes_by_language(r2_client, limit_per_lang=None, max_languages=None, languages_filter=None):
     """
     Efficiently lists unique episode prefixes from R2 grouped by normalized base language.
     Parallelizes episode listing per language to speed up scanning.
     """
     t0 = time.time()
     print("[scan] Listing all episode prefixes from R2 by language (parallel)...")
+    if languages_filter:
+        try:
+            # Ensure set for O(1) lookup
+            languages_filter = set(languages_filter)
+        except Exception:
+            pass
+        print(f"[scan] Language filter active: {sorted(languages_filter)}")
     prefixes_by_lang = {}
     paginator = r2_client.get_paginator('list_objects_v2')
 
@@ -92,6 +99,8 @@ def list_all_episode_prefixes_by_language(r2_client, limit_per_lang=None, max_la
             lang_prefix = lang_prefix_data.get('Prefix')
             raw_language = lang_prefix.strip('/').split('/')[-1]
             normalized_language = _normalize_language_code(raw_language)
+            if languages_filter and normalized_language not in languages_filter:
+                continue
             language_entries.append((normalized_language, lang_prefix))
     print(f"[scan] Total languages discovered: {len(language_entries)}")
 
@@ -219,7 +228,21 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Build and upload a Hugging Face dataset from R2.")
     parser.add_argument("--scan", action="store_true", help="Scan R2 and create a work plan. Run this once.")
+    parser.add_argument(
+        "--language", "--lang", dest="languages", action="append", default=None,
+        help="Language code(s) to include (e.g., en, de, jp). Can be repeated or comma-separated."
+    )
     args = parser.parse_args()
+
+    # Build a normalized language filter set if provided
+    languages_filter = None
+    if args.languages:
+        raw_tokens = []
+        for value in args.languages:
+            raw_tokens.extend([t.strip() for t in value.split(',') if t.strip()])
+        normalized_tokens = [_normalize_language_code(t) for t in raw_tokens]
+        # Filter out unknown / empty
+        languages_filter = {t for t in normalized_tokens if t and t != "unknown"}
 
     os.makedirs(os.path.dirname(PROGRESS_LOG), exist_ok=True)
 
@@ -227,7 +250,10 @@ def main():
         print("--- Scan Mode ---")
         print("NOTE: Applying test limit of 10 episodes per language.")
         r2_client = get_r2_client()
-        prefixes_by_lang = list_all_episode_prefixes_by_language(r2_client, limit_per_lang=10)
+        prefixes_by_lang = list_all_episode_prefixes_by_language(
+            r2_client,
+            languages_filter=languages_filter,
+        )
         print("[scan] Writing work plan to disk ...")
         with open(WORK_PLAN_FILE, 'w') as f:
             json.dump(prefixes_by_lang, f, indent=2)
@@ -243,7 +269,16 @@ def main():
     print("[proc] Loading work plan ...")
     with open(WORK_PLAN_FILE, 'r') as f:
         prefixes_by_lang = json.load(f)
+    if languages_filter:
+        print(f"[proc] Language filter active: {sorted(languages_filter)}")
+        prefixes_by_lang = {
+            k: v for k, v in prefixes_by_lang.items()
+            if _normalize_language_code(k) in languages_filter
+        }
     print(f"[proc] Languages in plan: {len(prefixes_by_lang)}")
+    if not prefixes_by_lang:
+        print("[proc] No languages to process after applying filter.")
+        return
     
     completed_chunks = load_completed_chunks()
     print(f"[proc] Completed chunks in log: {len(completed_chunks)}")
