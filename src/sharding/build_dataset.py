@@ -30,14 +30,19 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 # --- Batching and Concurrency Controls ---
 # How many podcast episodes to process in one go before creating a shard and uploading.
 # With 128GB RAM, you can use a large chunk size for more efficient commits.
-EPISODES_PER_CHUNK = int(os.environ.get("EPISODES_PER_CHUNK", "500"))
+EPISODES_PER_CHUNK = int(os.environ.get("EPISODES_PER_CHUNK", "1000"))
 # Number of parallel threads to fetch data from R2.
 DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "128"))
 
+# Max size per Parquet shard (bytes). Default ~2 GiB.
+PARQUET_MAX_BYTES = int(os.environ.get("PARQUET_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
+
 
 # --- File Paths for State Management ---
-PROGRESS_LOG = "../progress.log"
-WORK_PLAN_FILE = "../work_plan.json"
+# Store progress and plan in the process working directory (where the user runs the script)
+BASE_STATE_DIR = os.getcwd()
+PROGRESS_LOG = os.path.join(BASE_STATE_DIR, "progress.log")
+WORK_PLAN_FILE = os.path.join(BASE_STATE_DIR, "work_plan.json")
 
 
 # --- 2. R2 Client and Helper Functions ---
@@ -346,34 +351,75 @@ def main():
                 mark_chunk_as_completed(chunk_id)
                 continue
 
-            print(f"[proc:{language}] building HF dataset object ...")
-            dataset_chunk = Dataset.from_list(all_examples_for_chunk, features=features)
+            # Partition by approximate size so each Parquet file is <= PARQUET_MAX_BYTES
+            def _partition_by_size(examples, max_bytes):
+                groups = []
+                current = []
+                current_bytes = 0
+                for ex in examples:
+                    b = len(ex.get("audio", {}).get("bytes", b""))
+                    if current and current_bytes + b > max_bytes:
+                        groups.append(current)
+                        current = []
+                        current_bytes = 0
+                    current.append(ex)
+                    current_bytes += b
+                if current:
+                    groups.append(current)
+                return groups
 
-            # Append-only upload via create_commit: write a Parquet shard per chunk
-            repo_path = f"data/{language}/chunk-{i:05d}.parquet"
-            print(f"[proc:{language}] uploading chunk {chunk_id} to {HF_REPO_ID} at '{repo_path}' (append-only) ...")
+            parts = _partition_by_size(all_examples_for_chunk, PARQUET_MAX_BYTES)
+            num_parts = len(parts)
+            if num_parts == 1:
+                print(f"[proc:{language}] building HF dataset object ...")
+            else:
+                print(f"[proc:{language}] building HF datasets for {num_parts} parts (size-limited)")
+
+            # Append-only upload via create_commit: write Parquet per part
+            base_repo_path = f"data/{language}/chunk-{i:05d}.parquet"
+            print(f"[proc:{language}] uploading chunk {chunk_id} ({num_parts} part(s)) to {HF_REPO_ID} ...")
             try:
                 t_up = time.time()
-                with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmpf:
-                    tmp_path = tmpf.name
-                try:
-                    dataset_chunk.to_parquet(tmp_path)
-                    api = HfApi()
-                    api.create_commit(
-                        repo_id=HF_REPO_ID,
-                        repo_type="dataset",
-                        operations=[
+                operations = []
+                tmp_paths = []
+                api = HfApi()
+
+                if num_parts == 1:
+                    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmpf:
+                        tmp_path = tmpf.name
+                    tmp_paths.append(tmp_path)
+                    Dataset.from_list(parts[0], features=features).to_parquet(tmp_path)
+                    operations.append(
+                        CommitOperationAdd(
+                            path_in_repo=base_repo_path,
+                            path_or_fileobj=tmp_path,
+                        )
+                    )
+                else:
+                    for p_idx, part_examples in enumerate(parts):
+                        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmpf:
+                            tmp_path = tmpf.name
+                        tmp_paths.append(tmp_path)
+                        Dataset.from_list(part_examples, features=features).to_parquet(tmp_path)
+                        part_repo_path = f"data/{language}/chunk-{i:05d}-part-{p_idx:02d}.parquet"
+                        operations.append(
                             CommitOperationAdd(
-                                path_in_repo=repo_path,
+                                path_in_repo=part_repo_path,
                                 path_or_fileobj=tmp_path,
                             )
-                        ],
-                        commit_message=f"Append data chunk {i+1}/{len(prefix_chunks)} for lang '{language}'",
-                        token=HF_TOKEN,
-                    )
-                finally:
+                        )
+
+                api.create_commit(
+                    repo_id=HF_REPO_ID,
+                    repo_type="dataset",
+                    operations=operations,
+                    commit_message=f"Append data chunk {i+1}/{len(prefix_chunks)} for lang '{language}' ({num_parts} part(s))",
+                    token=HF_TOKEN,
+                )
+
+                for _p in tmp_paths:
                     try:
-                        os.remove(tmp_path)
+                        os.remove(_p)
                     except Exception:
                         pass
                 mark_chunk_as_completed(chunk_id)
