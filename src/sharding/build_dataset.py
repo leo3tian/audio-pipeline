@@ -14,6 +14,7 @@ try:
 except Exception:
     tqdm = None
 from huggingface_hub import HfApi, CommitOperationAdd
+import traceback
 import tempfile
 
 # --- 1. Configuration ---
@@ -459,7 +460,23 @@ def main():
                 mark_chunk_as_completed(chunk_id)
                 print(f"[proc:{language}] DONE {chunk_id} upload in {time.time()-t_up:.2f}s (total {time.time()-t_chunk:.2f}s)")
             except Exception as e:
-                print(f"[proc:{language}] ERROR uploading {chunk_id}: {e}")
+                print(f"[proc:{language}] ERROR uploading {chunk_id}: {type(e).__name__}: {e}")
+                # Try to surface HTTP response details if present (e.g., quota exceeded)
+                resp = getattr(e, 'response', None)
+                if resp is not None:
+                    try:
+                        status = getattr(resp, 'status_code', None)
+                        text = resp.text if hasattr(resp, 'text') else None
+                        print(f"[proc:{language}] HTTP status: {status}")
+                        if text:
+                            # Trim very long bodies
+                            preview = text if len(text) < 2000 else text[:2000] + '...'
+                            print(f"[proc:{language}] Response text: {preview}")
+                    except Exception:
+                        pass
+                else:
+                    tb = ''.join(traceback.format_exc())
+                    print(f"[proc:{language}] Traceback:\n{tb}")
                 print(f"[proc:{language}] Will retry this chunk on next run.")
 
         if lang_pbar is not None:
