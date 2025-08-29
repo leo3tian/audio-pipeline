@@ -16,6 +16,8 @@ except Exception:
 from huggingface_hub import HfApi, CommitOperationAdd
 import traceback
 import tempfile
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # --- 1. Configuration ---
 # pip install datasets "huggingface_hub[hf_transfer]" boto3
@@ -37,6 +39,8 @@ DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "128"))
 
 # Max size per Parquet shard (bytes). Default ~2 GiB.
 PARQUET_MAX_BYTES = int(os.environ.get("PARQUET_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
+# Max bytes per Parquet row group/batch when streaming (default ~128 MiB)
+PARQUET_ROWGROUP_BYTES = int(os.environ.get("PARQUET_ROWGROUP_BYTES", str(128 * 1024 * 1024)))
 
 
 # --- File Paths for State Management ---
@@ -419,11 +423,70 @@ def main():
                 tmp_paths = []
                 api = HfApi()
 
+                # Helper to stream-write one part to Parquet without building a full Dataset
+                def _write_part_streaming(part_examples, out_path):
+                    audio_struct_fields = [
+                        pa.field('path', pa.string()),
+                        pa.field('bytes', pa.binary())
+                    ]
+                    schema = pa.schema([
+                        pa.field('audio', pa.struct(audio_struct_fields)),
+                        pa.field('text', pa.string()),
+                        pa.field('speaker_id', pa.string()),
+                        pa.field('duration_seconds', pa.float32()),
+                        pa.field('dnsmos', pa.float32()),
+                        pa.field('language', pa.string()),
+                    ])
+                    writer = pq.ParquetWriter(out_path, schema=schema)
+                    try:
+                        batch = []
+                        bytes_in_batch = 0
+                        for ex in part_examples:
+                            b = len(ex.get('audio', {}).get('bytes', b''))
+                            # If adding this example would exceed the rowgroup budget and we have some rows, flush
+                            if batch and (bytes_in_batch + b > PARQUET_ROWGROUP_BYTES):
+                                audio_paths = [row['audio']['path'] for row in batch]
+                                audio_bytes = [row['audio']['bytes'] for row in batch]
+                                audio_path_arr = pa.array(audio_paths, type=pa.string())
+                                audio_bytes_arr = pa.array(audio_bytes, type=pa.binary())
+                                audio_struct = pa.StructArray.from_arrays([audio_path_arr, audio_bytes_arr], fields=audio_struct_fields)
+                                table = pa.Table.from_arrays([
+                                    audio_struct,
+                                    pa.array([row['text'] for row in batch], type=pa.string()),
+                                    pa.array([row['speaker_id'] for row in batch], type=pa.string()),
+                                    pa.array([row['duration_seconds'] for row in batch], type=pa.float32()),
+                                    pa.array([row['dnsmos'] for row in batch], type=pa.float32()),
+                                    pa.array([row['language'] for row in batch], type=pa.string()),
+                                ], schema=schema)
+                                writer.write_table(table)
+                                batch = []
+                                bytes_in_batch = 0
+                            batch.append(ex)
+                            bytes_in_batch += b
+                        # flush remaining
+                        if batch:
+                            audio_paths = [row['audio']['path'] for row in batch]
+                            audio_bytes = [row['audio']['bytes'] for row in batch]
+                            audio_path_arr = pa.array(audio_paths, type=pa.string())
+                            audio_bytes_arr = pa.array(audio_bytes, type=pa.binary())
+                            audio_struct = pa.StructArray.from_arrays([audio_path_arr, audio_bytes_arr], fields=audio_struct_fields)
+                            table = pa.Table.from_arrays([
+                                audio_struct,
+                                pa.array([row['text'] for row in batch], type=pa.string()),
+                                pa.array([row['speaker_id'] for row in batch], type=pa.string()),
+                                pa.array([row['duration_seconds'] for row in batch], type=pa.float32()),
+                                pa.array([row['dnsmos'] for row in batch], type=pa.float32()),
+                                pa.array([row['language'] for row in batch], type=pa.string()),
+                            ], schema=schema)
+                            writer.write_table(table)
+                    finally:
+                        writer.close()
+
                 if num_parts == 1:
                     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmpf:
                         tmp_path = tmpf.name
                     tmp_paths.append(tmp_path)
-                    Dataset.from_list(parts[0], features=features).to_parquet(tmp_path)
+                    _write_part_streaming(parts[0], tmp_path)
                     operations.append(
                         CommitOperationAdd(
                             path_in_repo=base_repo_path,
@@ -435,7 +498,7 @@ def main():
                         with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmpf:
                             tmp_path = tmpf.name
                         tmp_paths.append(tmp_path)
-                        Dataset.from_list(part_examples, features=features).to_parquet(tmp_path)
+                        _write_part_streaming(part_examples, tmp_path)
                         part_repo_path = f"data/{language}/chunk-{i:05d}-part-{p_idx:02d}.parquet"
                         operations.append(
                             CommitOperationAdd(
