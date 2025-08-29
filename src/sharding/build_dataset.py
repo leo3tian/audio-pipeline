@@ -241,6 +241,14 @@ def main():
         "--language", "--lang", dest="languages", action="append", default=None,
         help="Language code(s) to include (e.g., en, de, jp). Can be repeated or comma-separated."
     )
+    parser.add_argument(
+        "--chunk-mod", dest="chunk_mod", type=int, default=None,
+        help="Process only chunks whose index %% chunk_mod == chunk_rem."
+    )
+    parser.add_argument(
+        "--chunk-rem", dest="chunk_rem", type=int, default=None,
+        help="Remainder for chunk selection; requires --chunk-mod."
+    )
     args = parser.parse_args()
 
     # Build a normalized language filter set if provided
@@ -289,6 +297,20 @@ def main():
         print("[proc] No languages to process after applying filter.")
         return
     
+    # Validate chunk selection flags
+    chunk_mod = args.chunk_mod
+    chunk_rem = args.chunk_rem
+    if (chunk_mod is None) ^ (chunk_rem is None):
+        print("Error: --chunk-mod and --chunk-rem must be provided together.")
+        return
+    if chunk_mod is not None:
+        if chunk_mod <= 0:
+            print("Error: --chunk-mod must be a positive integer.")
+            return
+        if not (0 <= chunk_rem < chunk_mod):
+            print("Error: --chunk-rem must satisfy 0 <= chunk_rem < chunk_mod.")
+            return
+    
     completed_chunks = load_completed_chunks()
     print(f"[proc] Completed chunks in log: {len(completed_chunks)}")
 
@@ -310,13 +332,25 @@ def main():
         ]
         print(f"[proc:{language}] chunks={len(prefix_chunks)} chunk_size<=${EPISODES_PER_CHUNK}")
 
+        # Determine which chunks are selected by modulo, if any
+        if chunk_mod is not None:
+            selected_indices = [idx for idx in range(len(prefix_chunks)) if (idx % chunk_mod) == chunk_rem]
+            selected_total_episodes = sum(len(prefix_chunks[idx]) for idx in selected_indices)
+            print(f"[proc:{language}] selection by modulo: mod={chunk_mod} rem={chunk_rem} -> selected_chunks={len(selected_indices)} selected_episodes={selected_total_episodes}")
+        else:
+            selected_indices = list(range(len(prefix_chunks)))
+            selected_total_episodes = len(all_prefixes)
+
         # Set up a language-level progress tracker across all chunks
         language_done = 0
         lang_pbar = None
         if tqdm is not None:
-            lang_pbar = tqdm(total=len(all_prefixes), desc=f"{language} episodes", mininterval=0.5)
+            lang_pbar = tqdm(total=selected_total_episodes, desc=f"{language} episodes", mininterval=0.5)
 
         for i, chunk_of_prefixes in enumerate(prefix_chunks):
+            # Skip chunks not in the selected set (if modulo selection is active)
+            if i not in selected_indices:
+                continue
             chunk_id = f"{language}-{i}"
             if chunk_id in completed_chunks:
                 print(f"[proc:{language}] SKIP completed {chunk_id}")
