@@ -27,6 +27,7 @@ downloads/
 audio_downloads/
 processed/
 *_processed/
+node_modules/
 
 # Temp files
 *.wav

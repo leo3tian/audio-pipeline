@@ -1,0 +1,35 @@
+# wrangler.toml - Configuration for our Cloudflare Worker
+
+# The name of your worker.
+name = "podcast-downloader-worker"
+# The entry point for your worker.
+main = "cf-downloader/index.js"
+# The compatibility date ensures your worker runs on a stable version of the Workers runtime.
+compatibility_date = "2024-03-12"
+
+# --- R2 Bucket Binding ---
+# This makes your R2 bucket available to the worker code.
+# You will need to create a bucket named 'podcast-audio' in your Cloudflare dashboard
+# and then link it to this worker.
+[[r2_buckets]]
+binding = "R2_BUCKET" # This is the name of the variable in your JS code
+bucket_name = "podcastindex-dataset"
+
+# --- Queue Consumer Binding ---
+# This configures the worker to be a consumer for the specified queue.
+# Any message sent to this queue will automatically trigger the worker's 'queue' handler.
+[[queues.consumers]]
+queue = "download-urls" # The name of your queue
+  # --- Settings from the Cloudflare Dashboard ---
+  # Number of messages in the queue to be batched for delivery
+  max_batch_size = 5
+  # Maximum number of seconds the queue will wait for a batch to fill up
+  max_batch_timeout = 5
+  # Maximum number of times to retry delivery of a message before failing
+  max_retries = 3
+  # Minimum number of seconds to wait before retrying delivery of a message
+  retry_delay = 3600
+  # Queue where messages that fail to deliver despite retries will be sent
+  dead_letter_queue = "download-urls-dlq"
+  # Maximum concurrency your consumer will scale up to
+  max_concurrency = 40

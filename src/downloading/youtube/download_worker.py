@@ -37,8 +37,8 @@ SQS_BATCH_SIZE = 1
 MAX_DOWNLOAD_SPEED = 6_250_000  # 50 Mbps
 MIN_DOWNLOAD_SPEED = 4_000_000  # 32 Mbps
 # Rest period between videos (in seconds)
-MIN_REST_PERIOD = 30
-MAX_REST_PERIOD = 60
+MIN_REST_PERIOD = 3
+MAX_REST_PERIOD = 5
 
 # Logging Configuration
 LOG_DIR = Path("logs")
