@@ -16,9 +16,9 @@ As of 09/02/2025, the flow I'm using is downloading from PodcastIndex to R2, the
 
 Util scripts are in `util/` and can be used to gauge the progress of the pipeline via reading from Cloudflare R2.
 
-## Development
+## Other files
 - Python deps are in `requirements.txt` (used by the Dockerfile).
-- `cache_models.py` pre-caches models during the image build.
+- `cache_models.py` pre-caches models during the image build (also used by the Dockerfile).
 
 ## Credits
 - Emilia Pipe inspiration and related ideas draw from OpenMMLab Amphion and community work.
