@@ -204,6 +204,14 @@ def fetch_episode_data(prefix):
         segments = json.loads(metadata_obj['Body'].read())
         #print(f"[fetch] meta OK {metadata_key} segments={len(segments)} (+{time.time()-t0:.2f}s)")
 
+        # derive normalized language from prefix path: processed/<lang>/<episode_id>/
+        try:
+            parts = prefix.strip('/').split('/')
+            raw_lang_from_prefix = parts[1] if len(parts) >= 3 else "unknown"
+            normalized_language = _normalize_language_code(raw_lang_from_prefix)
+        except Exception:
+            normalized_language = "unknown"
+
         for i, segment in enumerate(segments):
             episode_id = prefix.strip('/').split('/')[-1]
             audio_filename = f"{episode_id}_{i:06d}.mp3"
@@ -213,6 +221,7 @@ def fetch_episode_data(prefix):
             audio_bytes = audio_obj['Body'].read()
 
             examples.append({
+                "id": f"{normalized_language}_{episode_id}_{i:06d}",
                 "audio": {"path": audio_key, "bytes": audio_bytes},
                 "text": segment.get("text", ""),
                 "speaker_id": segment.get("speaker", "UNKNOWN"),
@@ -345,6 +354,7 @@ def main():
     print(f"[proc] Completed chunks in log: {len(completed_chunks)}")
 
     features = Features({
+        'id': Value('string'),
         'audio': Audio(sampling_rate=16000),
         'text': Value('string'),
         'speaker_id': Value('string'),
@@ -455,6 +465,7 @@ def main():
                         pa.field('bytes', pa.binary())
                     ]
                     schema = pa.schema([
+                        pa.field('id', pa.string()),
                         pa.field('audio', pa.struct(audio_struct_fields)),
                         pa.field('text', pa.string()),
                         pa.field('speaker_id', pa.string()),
@@ -476,6 +487,7 @@ def main():
                                 audio_bytes_arr = pa.array(audio_bytes, type=pa.binary())
                                 audio_struct = pa.StructArray.from_arrays([audio_path_arr, audio_bytes_arr], fields=audio_struct_fields)
                                 table = pa.Table.from_arrays([
+                                    pa.array([row['id'] for row in batch], type=pa.string()),
                                     audio_struct,
                                     pa.array([row['text'] for row in batch], type=pa.string()),
                                     pa.array([row['speaker_id'] for row in batch], type=pa.string()),
@@ -496,6 +508,7 @@ def main():
                             audio_bytes_arr = pa.array(audio_bytes, type=pa.binary())
                             audio_struct = pa.StructArray.from_arrays([audio_path_arr, audio_bytes_arr], fields=audio_struct_fields)
                             table = pa.Table.from_arrays([
+                                pa.array([row['id'] for row in batch], type=pa.string()),
                                 audio_struct,
                                 pa.array([row['text'] for row in batch], type=pa.string()),
                                 pa.array([row['speaker_id'] for row in batch], type=pa.string()),

@@ -85,6 +85,26 @@ def print_dict_nicely(d, indent=0):
         else:
             print('  ' * indent + f"{key}: {value}")
 
+def extract_episode_url(entry):
+    """Attempt to extract the most relevant episode URL (prefer enclosure)."""
+    # Prefer direct media enclosures first
+    for link in entry.get('links', []):
+        if link.get('rel') == 'enclosure' and link.get('href'):
+            return link['href']
+    # Then check enclosures list if present
+    for enclosure in entry.get('enclosures', []):
+        href = enclosure.get('href')
+        if href:
+            return href
+    # Alternate audio link
+    for link in entry.get('links', []):
+        if link.get('rel') == 'alternate' and link.get('type', '').startswith('audio/') and link.get('href'):
+            return link['href']
+    # Fallback to the generic entry link
+    if entry.get('link'):
+        return entry['link']
+    return None
+
 def main():
     """
     Main function to fetch, parse, and score an RSS feed's metadata.
@@ -126,6 +146,16 @@ def main():
         print(" Overall Feed Information")
         print("="*50)
         print_dict_nicely(feed_info)
+        
+        # --- Print Episode URLs for All Entries ---
+        if feed.entries:
+            print("\n" + "="*50)
+            print(" Episode URLs")
+            print("="*50)
+            for i, entry in enumerate(feed.entries):
+                url = extract_episode_url(entry)
+                title = entry.get('title', '(no title)')
+                print(f"[{i}] {title}: {url or '(no URL found)'}")
         
         # --- Print Metadata for the First Episode ---
         if feed.entries:

@@ -17,9 +17,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Configuration ---
 # You can change these values or set them as environment variables
-# This is the queue workers pull from
-FEEDS_SQS_QUEUE_URL = os.getenv("FEEDS_SQS_QUEUE_URL", "https://sqs.us-west-1.amazonaws.com/450282239172/FeedsToProcessQueue")
-# This is the final queue for downloaders
+# This is the final queue for downloaders (legacy, unused here)
 DOWNLOAD_SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL", "https://sqs.us-west-1.amazonaws.com/450282239172/PodcastIndexQueue")
 DYNAMODB_TABLE_NAME = os.getenv("DYNAMODB_TABLE_NAME", "PodcastIndexJobs")
 AWS_REGION = os.getenv("AWS_REGION", "us-west-1")
@@ -33,12 +31,17 @@ CF_API_TOKEN = os.getenv("CF_API_TOKEN")
 
 # --- Tuning Levers ---
 DB_UPDATE_BATCH_SIZE = int(os.getenv("DB_UPDATE_BATCH_SIZE", 100))
-# The threshold at which we start staggering SQS messages
+# The threshold at which we start staggering messages to Cloudflare
 STAGGER_THRESHOLD = 20
 # How many jobs to send in each staggered batch
 STAGGER_BATCH_SIZE = 20
 # How many seconds to delay each subsequent batch
 STAGGER_DELAY_SECONDS = 10
+
+# Consolidated scheduler settings (from feeder)
+FEEDER_BATCH_SIZE = int(os.getenv("FEEDER_BATCH_SIZE", 1000))
+FEEDER_SLEEP_SECONDS = int(os.getenv("FEEDER_SLEEP_SECONDS", 10))
+STALE_JOB_TIMEOUT_MINUTES = int(os.getenv("STALE_JOB_TIMEOUT_MINUTES", 10))
 
 # --- AWS / DB Config ---
 PG_HOST = os.getenv("PG_HOST")
@@ -116,7 +119,6 @@ logging.getLogger("cloudflare").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- AWS / DB Clients ---
-sqs_client = boto3.client("sqs", region_name=AWS_REGION)
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 dynamodb_table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
@@ -206,6 +208,56 @@ def get_postgres_conn():
     except psycopg2.OperationalError as e:
         logging.error(f"Could not connect to PostgreSQL database: {e}")
         return None
+
+def set_processing_status(podcast_id, status):
+    """Directly set a single podcast's processing_status and updated_at."""
+    conn = get_postgres_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE podcasts
+                SET processing_status = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s;
+                """,
+                (status, podcast_id)
+            )
+        conn.commit()
+    except psycopg2.Error as e:
+        logging.error(f"DB Error updating status for id {podcast_id} to '{status}': {e}")
+        conn.rollback()
+        conn.close()
+
+def reset_stale_jobs():
+    """
+    Finds jobs that have been 'in_progress' for too long and resets them to 'pending'.
+    This prevents jobs from getting stuck if a worker crashes.
+    """
+    conn = get_postgres_conn()
+    if not conn:
+        return 0
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE podcasts
+                SET processing_status = 'pending', updated_at = CURRENT_TIMESTAMP
+                WHERE processing_status = 'in_progress'
+                AND updated_at < NOW() - INTERVAL %s;
+                """,
+                (f"{STALE_JOB_TIMEOUT_MINUTES} minutes",)
+            )
+            stale_count = cursor.rowcount
+            conn.commit()
+            if stale_count > 0:
+                logging.warning(f"Reset {stale_count} stale 'in_progress' jobs back to 'pending'.")
+            return stale_count
+    except psycopg2.Error as e:
+        logging.error(f"DB Error resetting stale jobs: {e}")
+        conn.close()
+        return 0
 
 # --- New Status ---
 # 'complete_empty' is for feeds that parse correctly but have no valid audio.
@@ -415,38 +467,28 @@ def enqueue_episodes_to_cf(podcast_id, rss_url, language, episodes_to_enqueue):
 
     return episodes_enqueued
 
-def process_feed_job(message):
+def process_feed(podcast_id, rss_url, language):
     """
-    Processes a single feed job from the SQS queue.
+    Processes a single feed: fetch, filter, extract new episodes, enqueue to Cloudflare,
+    and update DB status accordingly.
     """
-    receipt_handle = message['ReceiptHandle']
-    try:
-        body = json.loads(message['Body'])
-        podcast_id = body['podcast_id']
-        rss_url = body['rss_url']
-        language = body.get('language', 'unknown')
-    except (KeyError, json.JSONDecodeError) as e:
-        logging.error(f"Invalid message format, deleting from queue: {message['Body']} - {e}")
-        sqs_client.delete_message(QueueUrl=FEEDS_SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
-        return
-
     # --- Pre-flight checks ---
     hostname = requests.utils.urlparse(rss_url).hostname
     if hostname and PRIVATE_IP_REGEX.match(hostname):
         logging.warning(f"[{podcast_id}] Skipping private/internal IP address: {rss_url}")
         mark_feed_as_failed(podcast_id)
-        sqs_client.delete_message(QueueUrl=FEEDS_SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
         return
 
     try:
         # 1. Fetch and parse the feed.
         feed = fetch_and_parse_feed(rss_url)
         if feed is None:
-            # This indicates a temporary failure; let SQS handle the retry.
+            # Temporary failure; immediately revert to pending for retry soon.
+            set_processing_status(podcast_id, 'pending')
             return
-            
+
         if feed.bozo:
-            feed.bozo = 0 # Suppress the warning print by feedparser
+            feed.bozo = 0 # Suppress warning print by feedparser
             logging.warning(f"[{podcast_id}] Bozo feed (might be malformed): {rss_url} - {feed.bozo_exception}")
 
         # 2. Score the feed's content.
@@ -457,7 +499,6 @@ def process_feed_job(message):
                 f"[{podcast_id}] Filtered: Score {score} is below threshold. Feed: '{feed_title}', URL: {rss_url}"
             )
             mark_feed_as_status(podcast_id, 'complete_filtered')
-            sqs_client.delete_message(QueueUrl=FEEDS_SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
             return
 
         # 3. Extract all audio URLs from the feed.
@@ -466,7 +507,8 @@ def process_feed_job(message):
         for entry in feed.entries:
             for enclosure in getattr(entry, 'enclosures', []):
                 href = enclosure.get('href')
-                if not href: continue
+                if not href:
+                    continue
 
                 is_audio_mime = 'audio' in enclosure.get('type', '')
                 has_audio_extension = any(href.lower().endswith(ext) for ext in audio_extensions)
@@ -478,7 +520,6 @@ def process_feed_job(message):
         if not all_episode_urls:
             logging.warning(f"[{podcast_id}] Empty: No audio enclosures found. URL: {rss_url}")
             mark_feed_as_status(podcast_id, 'complete_empty')
-            sqs_client.delete_message(QueueUrl=FEEDS_SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
             return
 
         # 4. Check for existing episodes in DynamoDB.
@@ -487,73 +528,105 @@ def process_feed_job(message):
 
         if not new_episodes_to_enqueue:
             mark_feed_as_complete(podcast_id)
-            sqs_client.delete_message(QueueUrl=FEEDS_SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
             return
 
         # 5. Enqueue new episodes to the Cloudflare Queue.
         episodes_enqueued = enqueue_episodes_to_cf(
             podcast_id, rss_url, language, new_episodes_to_enqueue
         )
-        
+
         # 6. Mark the feed as complete.
         logging.info(f"[{podcast_id}] Success: Enqueued {episodes_enqueued} new episodes. URL: {rss_url}")
         mark_feed_as_complete(podcast_id)
-        sqs_client.delete_message(QueueUrl=FEEDS_SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
 
     except PermanentFeedError as e:
         # Handle permanent feed fetch errors (e.g., 404 Not Found).
         logging.error(e)
         mark_feed_as_failed(podcast_id)
-        sqs_client.delete_message(QueueUrl=FEEDS_SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
     except Exception as e:
         logging.error(f"Failed to process feed {rss_url}: {e}", exc_info=True)
         # For other unexpected errors, mark as failed so we don't retry indefinitely.
         mark_feed_as_failed(podcast_id)
-        sqs_client.delete_message(QueueUrl=FEEDS_SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
 
 
 def main():
     """
-    Main worker loop to continuously poll for and process feed jobs.
+    Consolidated main loop: reserve pending feeds from Postgres, process them,
+    and update statuses without using an intermediate SQS queue.
     """
-    if not FEEDS_SQS_QUEUE_URL or not DYNAMODB_TABLE_NAME:
+    if not DYNAMODB_TABLE_NAME:
         logging.error("Missing required AWS environment variables.")
         sys.exit(1)
 
-    logging.info("--- Starting Worker Script ---")
-    logging.info(f"Polling SQS Queue: {FEEDS_SQS_QUEUE_URL}")
+    logging.info("--- Starting Consolidated Worker Script ---")
     logging.info(f"DB Update Batch Size: {DB_UPDATE_BATCH_SIZE}")
+    logging.info(f"Batch Size: {FEEDER_BATCH_SIZE}, Sleep Time: {FEEDER_SLEEP_SECONDS}s, Stale Timeout: {STALE_JOB_TIMEOUT_MINUTES}min")
 
+    # Ensure we can connect to Postgres up-front
+    if not get_postgres_conn():
+        logging.error("Cannot start: No DB connection.")
+        sys.exit(1)
+
+    loop_count = 0
     try:
         while True:
             try:
-                response = sqs_client.receive_message(
-                    QueueUrl=FEEDS_SQS_QUEUE_URL,
-                    MaxNumberOfMessages=10, # Fetch more messages to improve throughput
-                    WaitTimeSeconds=20,
-                    AttributeNames=['All']
-                )
-                if "Messages" in response:
-                    for message in response["Messages"]:
-                        process_feed_job(message)
-                        time.sleep(2)
-                else:
-                    logging.info("Queue is empty, waiting for new messages...")
-                    # Flush any lingering items if the queue is empty
-                    flush_db_update_batch('complete', force_flush=True)
-                    flush_db_update_batch('failed', force_flush=True)
-                    flush_db_update_batch('complete_empty', force_flush=True)
-                    flush_db_update_batch('complete_filtered', force_flush=True) # Added for new status
+                loop_count += 1
+                if loop_count % 5 == 0:
+                    reset_stale_jobs()
+
+                conn = get_postgres_conn()
+                jobs_to_process = []
+                with conn.cursor() as cursor:
+                    # 1) Select and lock a batch of pending jobs
+                    cursor.execute(
+                        """
+                        SELECT id, url, language
+                        FROM podcasts
+                        WHERE processing_status = 'pending' AND episode_count > 25
+                        ORDER BY id
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT %s;
+                        """,
+                        (FEEDER_BATCH_SIZE,)
+                    )
+                    jobs_to_process = cursor.fetchall()
+
+                    if jobs_to_process:
+                        # 2) Mark selected jobs as in_progress in the same transaction
+                        job_ids = [row[0] for row in jobs_to_process]
+                        cursor.execute(
+                            """
+                            UPDATE podcasts
+                            SET processing_status = 'in_progress', updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ANY(%s);
+                            """,
+                            (job_ids,)
+                        )
+                conn.commit()
+
+                if not jobs_to_process:
+                    logging.info("No pending feeds found. Waiting...")
+                    time.sleep(FEEDER_SLEEP_SECONDS * 2)
+                    continue
+
+                logging.info(f"Reserved {len(jobs_to_process)} jobs. Processing...")
+                for podcast_id, rss_url, language in jobs_to_process:
+                    process_feed(podcast_id, rss_url, (language and language.strip()) or 'unknown')
+                    time.sleep(2)
+
+                # Optional: small sleep to avoid tight loops
+                time.sleep(FEEDER_SLEEP_SECONDS)
 
             except Exception as e:
-                logging.error(f"An error occurred in the main SQS loop: {e}")
-                time.sleep(10) # Wait before retrying
+                logging.error(f"An error occurred in the main loop: {e}")
+                time.sleep(10)
     finally:
         logging.info("--- Shutting down. Flushing final DB update batches... ---")
         flush_db_update_batch('complete', force_flush=True)
         flush_db_update_batch('failed', force_flush=True)
         flush_db_update_batch('complete_empty', force_flush=True)
-        flush_db_update_batch('complete_filtered', force_flush=True) # Added for new status
+        flush_db_update_batch('complete_filtered', force_flush=True)
         if pg_conn:
             pg_conn.close()
             logging.info("PostgreSQL connection closed.")
