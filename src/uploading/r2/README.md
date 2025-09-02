@@ -75,9 +75,7 @@ If you run multiple processes, start them in the same directory to share `work_p
 ## Notes
 
 - Data schema per row: `audio` (struct: `path`, `bytes`), `text`, `speaker_id`, `duration_seconds`, `dnsmos`, `language`.
-- Language normalization: e.g., "en-US"/"en_gb"/"ENG" → `en`; unknowns mapped to `unknown`.
-- Robustness: missing files are warned and skipped; uploads are append-only commits (previous files are preserved).
-- Tuning: adjust `EPISODES_PER_CHUNK`, `DOWNLOAD_WORKERS`, `PARQUET_MAX_BYTES`, `PARQUET_ROWGROUP_BYTES` for your hardware and repo limits.
+- We perform language normalization (because the PodcastIndex dataset contains accents such as en-ZH): e.g., "en-US"/"en_gb"/"ENG" → `en`; unknowns mapped to `unknown`.
 - Dependencies: `datasets`, `huggingface_hub[hf_transfer]`, `pyarrow`, `boto3`, `python-dotenv`, `tqdm`.
 
 ### Shard layout

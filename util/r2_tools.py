@@ -23,7 +23,7 @@ def build_s3_client() -> boto3.client:
 	if not r2_account_id and not custom_endpoint:
 		raise RuntimeError("R2_ACCOUNT_ID or R2_ENDPOINT must be set in the environment.")
 	if not r2_access_key_id or not r2_secret_access_key:
-		raise RuntimeError("R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY must be set in the environment.")
+		raise RuntimeError("R2_ID and R2_KEY must be set in the environment.")
 
 	endpoint_url = custom_endpoint or f"https://{r2_account_id}.r2.cloudflarestorage.com"
 
