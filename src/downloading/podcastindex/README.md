@@ -11,32 +11,20 @@ Notes
 
 ## File Breakdown & Infrastructure
 
-At a high level, the pipeline moves from PodcastIndex database  → RSS feed queue → RSS feed crawler → episode URL queue → episode URL downloader. There is a diagram at the bottom of this file if it's helpful.
+At a high level, the pipeline moves from PodcastIndex database → RSS feed crawler → episode URL downloader. There is a diagram at the bottom of this file if it's helpful.
 
-- **PodcastIndex database (Postgres)**: The PodcastIndex database which holds RSS URLs and also acts as the source of truth for job status. Podcasts are marked as `pending → in_progress → complete/failed` as they are processed. To interact with it, we've converted it to a PostgreSQL and hosted it on AWS RDS - see Setup section for how that works.
+- **PodcastIndex database (Postgres)**: The PodcastIndex database which holds RSS URLs and also acts as the source of truth for job status. Podcasts are marked as `pending → in_progress → complete/failed` as they are processed. To interact with it, we've converted it to a PostgreSQL and hosted it on AWS RDS (see Setup section for how to recreate it).
 - `feeder.py` reads podcast RSS feeds from Postgres and enqueues the feeds to an AWS SQS queue, marking them as in-progress.
 - `worker.py` consumes RSS feeds from the AWS SQS queue, crawls the RSS feeds to find all download URLs, then enqueues to **either a Cloudflare Queue or AWS SQS**
     - It also filters non-dialogue content, checks DynamoDB for already-processed episodes, and enqueues new episode URLs to the download queue. By default it pushes to a Cloudflare Queue, but alternatively you can push to AWS SQS and consume with `downloader.py`.
 - **DynamoDB database:** Database that keeps track of all downloaded episodes. Before downloading an episode, we check this database to make sure no episodes are repeated
->**Depending on whether you choose Cloudflare R2 or AWS S3 as your final data destination, you will use one of the following scripts.**
-
-- **Cloudflare:** `cf-downloader/index.js` runs as a Cloudflare Worker, consuming episode URLs from the queue, downloading them, then saving them to R2.
+- **Cloudflare downloader:** `cf-downloader/index.js` runs as a Cloudflare Worker, consuming episode URLs from the queue, downloading them, then saving them to R2.
     - It also records episode URLs in DynamoDB to prevent duplicates.
-
-- **AWS:** `downloader.py` is a downloader that consumes from `SQS_QUEUE_URL`, streams audio to S3 (`S3_BUCKET_NAME`), and writes a dedupe record to DynamoDB.
-
->*Q: Why not just have one script for both R2 and S3?*
->
->*A: Egress fees - if we only had a downloader on AWS, we would pay hundreds of dollars per TB downloaded when uploading to Cloudflare*
->For that reason, **Cloudflare is heavily recommended** - zero egress fees when pulling data to process on GPU clusters or upload to huggingface 
+- **AWS downloader:** DEPRECATED, prefer Cloudflare version, but can be used to download episodes to S3. `downloader.py` consumes episode URLs from the queue, downloads them, then saves them to S3.
 
 ## Setup
 
-### How to start the Cloudflare worker
-
-Deploy worker: (from /podcastindex) run `npx wrangler deploy`
-
-Tail worker logs: `npx wrangler tail`
+This section includes information about how to reset the pipeline.
 
 ### How to reset the pipeline
 
@@ -50,9 +38,11 @@ If you need to re‑run everything (download from scratch), reset these five com
 
 Once reset, run `feeder.py` then `worker.py` to repopulate and process from scratch.
 
-### How to move the PodcastIndex DB to PostgreSQL
+### How to reset Postgres (The PodcastIndex database)
 
-Load the PodcastIndex dataset (SQLite) straight into Postgres using CSV and `psql` (fast, no Python required).
+The original PodcastIndex database is in SQLite. We've converted it to Postgres for ease of use. The following steps will recreate the table and load the data.
+
+0) Download the SQLite database from the PodcastIndex website (https://podcastindex.org/, scroll near the bottom under "Developer? Join the fun!" to find a download link).
 
 1) Export the minimal columns from SQLite (run where `podcastindex.db` lives):
 
@@ -106,7 +96,7 @@ Set these for `feeder.py` and `worker.py`:
 
 `downloader.py` requires `SQS_QUEUE_URL` and `S3_BUCKET_NAME`.
 
-### Running the Cloudflare Downloader (`cf-downloader/index.js`)
+### 2. Running the Cloudflare Downloader (`cf-downloader/index.js`)
 
 The CF downloader is a Worker that consumes jobs from a Cloudflare Queue.
 
