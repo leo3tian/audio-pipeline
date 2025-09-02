@@ -5,6 +5,8 @@ This repo builds an audio dataset in three steps:
 2) Processing 
 3) Uploading 
 
+Each major folder has its own README.md file with more detailed information.
+
 ### Notes
 
 As of 09/02/2025, the flow I'm using is downloading from PodcastIndex to R2, then processing and uploading to Hugging Face. The following folders are used the most:
