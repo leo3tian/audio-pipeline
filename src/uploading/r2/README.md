@@ -6,7 +6,7 @@ Two-mode script to build and upload a Hugging Face dataset from R2-processed aud
 
 `build_dataset.py` scans `processed/<language>/<episode_id>/` prefixes in R2 and either:
 
-- Scan mode (`--scan`): creates a `work_plan.json` of episode prefixes grouped by language.
+- Scan mode (`--scan`): appends newly discovered episode prefixes to `work_plan.json` (append-only; preserves existing order, avoids duplicates).
 - Process mode: streams episode data, writes Parquet shard(s), and appends them to a Hugging Face dataset repo. Progress is tracked in `progress.log` so runs can resume safely.
 
 ## How To Run
@@ -40,9 +40,11 @@ export PARQUET_ROWGROUP_BYTES=$((128*1024*1024))    # ~128 MiB per row group
 export HF_HUB_ENABLE_HF_TRANSFER=1
 ```
 
+Files `work_plan.json` and `progress.log` are written to the current working directory (where you run the script). Run all cooperating processes from the same directory if you want them to share plan/progress.
+
 ### 2. Scan and create a work plan
 
-Scans R2 for available languages and episode prefixes and writes `work_plan.json`:
+Scans R2 for available languages and episode prefixes and appends them to `work_plan.json`:
 ```bash
 python src/uploading/r2/build_dataset.py --scan \
   --language en \
@@ -50,6 +52,7 @@ python src/uploading/r2/build_dataset.py --scan \
 ```
 Notes:
 - You can repeat `--language` to include multiple languages. If omitted, all languages found under `processed/` are included.
+- Running `--scan` again will merge in only new episode prefixes; it will not overwrite existing entries.
 
 ### 3. Process and upload chunks
 
@@ -67,11 +70,20 @@ python src/uploading/r2/build_dataset.py --chunk-mod 4 --chunk-rem 0
 python src/uploading/r2/build_dataset.py --chunk-mod 4 --chunk-rem 1
 ```
 
+If you run multiple processes, start them in the same directory to share `work_plan.json` and `progress.log`. Balance total concurrency by lowering `DOWNLOAD_WORKERS` per process.
+
 ## Notes
 
 - Data schema per row: `audio` (struct: `path`, `bytes`), `text`, `speaker_id`, `duration_seconds`, `dnsmos`, `language`.
 - Language normalization: e.g., "en-US"/"en_gb"/"ENG" → `en`; unknowns mapped to `unknown`.
-- Robustness: missing files are warned and skipped; uploads are append-only commits.
+- Robustness: missing files are warned and skipped; uploads are append-only commits (previous files are preserved).
 - Tuning: adjust `EPISODES_PER_CHUNK`, `DOWNLOAD_WORKERS`, `PARQUET_MAX_BYTES`, `PARQUET_ROWGROUP_BYTES` for your hardware and repo limits.
 - Dependencies: `datasets`, `huggingface_hub[hf_transfer]`, `pyarrow`, `boto3`, `python-dotenv`, `tqdm`.
+
+### Shard layout
+
+- Parquet shards are stored under `data/<language>/` with names like:
+  - `chunk-00012.parquet` (single-part), or
+  - `chunk-00012-part-00.parquet`, `chunk-00012-part-01.parquet` (size-partitioned)
+  Uploads use append-only commits so earlier shards are not pruned.
 

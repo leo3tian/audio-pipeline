@@ -269,16 +269,41 @@ def main():
     os.makedirs(os.path.dirname(PROGRESS_LOG), exist_ok=True)
 
     if args.scan:
-        print("--- Scan Mode ---")
-        print("NOTE: Applying test limit of 10 episodes per language.")
+        print("--- Scan Mode (append) ---")
         r2_client = get_r2_client()
-        prefixes_by_lang = list_all_episode_prefixes_by_language(
+        scanned = list_all_episode_prefixes_by_language(
             r2_client,
             languages_filter=languages_filter,
         )
-        print("[scan] Writing work plan to disk ...")
+        # Merge with existing plan if present (append-only, preserve existing order)
+        merged = {}
+        if os.path.exists(WORK_PLAN_FILE):
+            try:
+                with open(WORK_PLAN_FILE, 'r') as f:
+                    merged = json.load(f)
+            except Exception as e:
+                print(f"[scan] Warning: failed to read existing plan: {e}; starting fresh")
+                merged = {}
+
+        total_new = 0
+        for lang, new_prefixes in scanned.items():
+            existing_list = merged.get(lang, [])
+            existing_set = set(existing_list)
+            to_append = [p for p in new_prefixes if p not in existing_set]
+            if to_append:
+                print(f"[scan:{lang}] appending {len(to_append)} new episode prefixes")
+                existing_list.extend(to_append)
+                merged[lang] = existing_list
+                total_new += len(to_append)
+            else:
+                # ensure language key exists even if nothing new
+                if lang not in merged:
+                    merged[lang] = []
+
+        print(f"[scan] Total new prefixes added: {total_new}")
+        print("[scan] Writing merged work plan to disk ...")
         with open(WORK_PLAN_FILE, 'w') as f:
-            json.dump(prefixes_by_lang, f, indent=2)
+            json.dump(merged, f, indent=2)
         print(f"✅ Scan complete. Work plan saved to {WORK_PLAN_FILE}")
         return
 
