@@ -1,9 +1,8 @@
 # Podcast Downloader
 
-Three scripts to: 
-1) Read RSS feeds from the PodcastIndex database 
-2) Crawl RSS feeds to find episode URLs 
-3) Download audio files using episode URLs
+Two components to:
+1) Read RSS feeds from the PodcastIndex database, crawl RSS to find episode URLs, and enqueue them for download
+2) Download audio files using those episode URLs
 
 Notes
 - An RSS feed is basically a file that summarizes a podcast. We're interested in RSS feeds because they contain the audio enclosures of every episode in the podcast (which we can then download)
@@ -11,16 +10,12 @@ Notes
 
 ## File Breakdown & Infrastructure
 
-At a high level, the pipeline moves from PodcastIndex database → RSS feed crawler → episode URL downloader. There is a diagram at the bottom of this file if it's helpful.
+At a high level, the pipeline moves from PodcastIndex database → RSS worker → episode URL downloader. There is a diagram at the bottom of this file if it's helpful.
 
-- **PodcastIndex database (Postgres)**: The PodcastIndex database which holds RSS URLs and also acts as the source of truth for job status. Podcasts are marked as `pending → in_progress → complete/failed` as they are processed. To interact with it, we've converted it to a PostgreSQL and hosted it on AWS RDS (see Setup section for how to recreate it).
-- `feeder.py` reads podcast RSS feeds from Postgres and enqueues the feeds to an AWS SQS queue, marking them as in-progress.
-- `worker.py` consumes RSS feeds from the AWS SQS queue, crawls the RSS feeds to find all download URLs, then enqueues to **either a Cloudflare Queue or AWS SQS**
-    - It also filters non-dialogue content, checks DynamoDB for already-processed episodes, and enqueues new episode URLs to the download queue. By default it pushes to a Cloudflare Queue, but alternatively you can push to AWS SQS and consume with `downloader.py`.
-- **DynamoDB database:** Database that keeps track of all downloaded episodes. Before downloading an episode, we check this database to make sure no episodes are repeated
-- **Cloudflare downloader:** `cf-downloader/index.js` runs as a Cloudflare Worker, consuming episode URLs from the queue, downloading them, then saving them to R2.
-    - It also records episode URLs in DynamoDB to prevent duplicates.
-- **AWS downloader:** DEPRECATED, prefer Cloudflare version, but can be used to download episodes to S3. `downloader.py` consumes episode URLs from the queue, downloads them, then saves them to S3.
+- **PodcastIndex database (Postgres)**: The PodcastIndex database holds RSS URLs and acts as the source of truth for job status. Podcasts are marked as `pending → in_progress → complete/failed` as they are processed.
+- `worker.py` reads pending feeds directly from Postgres using `FOR UPDATE SKIP LOCKED`, marks them `in_progress`, fetches/parses RSS, filters non-dialogue content, checks DynamoDB for already-processed episodes, and enqueues new episode URLs to a **Cloudflare Queue**.
+- **DynamoDB database:** Tracks all downloaded episodes. We check this before enqueueing to avoid duplicates.
+- **Cloudflare downloader:** `cf-downloader/index.js` runs as a Cloudflare Worker, consuming episode URLs from the queue, downloading them, then saving them to R2. It also records episode URLs in DynamoDB to prevent duplicates.
 
 ## Setup
 
@@ -28,15 +23,14 @@ This section includes information about how to reset the pipeline.
 
 ### How to reset the pipeline
 
-If you need to re‑run everything (download from scratch), reset these five components:
+If you need to re‑run everything (download from scratch), reset these components:
 
 1) Reset Postgres (The PodcastIndex database): this marks all feeds unprocessed. See next section for instructions.
 2) Purge your Cloudflare queue (via the dashboard).
-3) Purge your AWS SQS queues (`FeedsToProcessQueue`, `PodcastIndexQueue`).
-4) Recreate DynamoDB table: delete and recreate `PodcastIndexJobs` with primary key `episode_url`.
-5) Clear storage: delete R2 objects (or bucket) or S3 prefix used for downloads.
+3) Recreate DynamoDB table: delete and recreate `PodcastIndexJobs` with primary key `episode_url`.
+4) Clear storage: delete R2 objects (or bucket).
 
-Once reset, run `feeder.py` then `worker.py` to repopulate and process from scratch.
+Once reset, run `worker.py` to repopulate and process from scratch.
 
 ### How to reset Postgres (The PodcastIndex database)
 
@@ -75,21 +69,19 @@ CREATE TABLE podcasts (
 
 ### How to Run
 
-These scripts are designed to be run on separate EC2 instances.
+These components are designed to be run on EC2 instances with access to RDS, DynamoDB, and Cloudflare.
 
-### 1. Running `feeder.py` and `worker.py` on AWS EC2
+### 1. Running `worker.py` on AWS EC2
 
-`feeder.py` and `worker.py` must be on an EC2 instance that can access your RDS instance, SQS, and DynamoDB.
+`worker.py` must be on an EC2 instance that can access your RDS instance, DynamoDB, and Cloudflare.
 
 #### Environment variables
 
-Set these for `feeder.py` and `worker.py`:
+Set these for `worker.py`:
 
 - **Database**: `PG_HOST`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD`
 - **Queues**:
-  - `FEEDS_SQS_QUEUE_URL` (for `feeder.py` → `worker.py`)
   - Cloudflare (`worker.py` → CF): `CF_ACCOUNT_ID`, `CF_QUEUE_ID`, `CF_API_TOKEN`
-  - SQS (`worker.py` → `downloader.py`): `SQS_QUEUE_URL`
 - **DynamoDB**: `DYNAMODB_TABLE_NAME`
 - **General**: `AWS_REGION`
 - **Tuning** (optional): `FEEDER_BATCH_SIZE`, `FEEDER_SLEEP_SECONDS`, `STALE_JOB_TIMEOUT_MINUTES`, `DB_UPDATE_BATCH_SIZE`
@@ -113,37 +105,32 @@ The CF downloader is a Worker that consumes jobs from a Cloudflare Queue.
 ```
 [ Postgres DB: Feed URLs & Status ]
       |
-      | 1. Feeder reads 'pending' feeds
-      v
-[ feeder.py ]
-      |
-      | 2. Enqueues jobs to be processed
-      v
-[ SQS Feed Queue ]
-      |
-      | 3. Workers consume feed jobs
+      | 1. worker.py reserves 'pending' feeds (SKIP LOCKED)
       v
 [ worker.py Fleet ]-------------------------------------+
       |                                                 |
-      | 4. Parses feed, finds episode URLs,             | 5. Updates feed status in DB
-      |    and enqueues them into ONE of two paths:     |    ('complete' or 'failed')
+      | 2. Parses feed, finds episode URLs,             | 3. Updates feed status in DB
+      |    and enqueues them to Cloudflare Queue        |    ('complete' or 'failed')
       v                                                 v
-+---------------------------------+           [ Postgres DB ]
-|         PIPELINE SPLITS         |
-+---------------------------------+
-                 |
-  +--------------+-----------------+
-  |                                |
-  v                                v
-[ Cloudflare Queue ]        [ SQS Download Queue ]
-(Episode URLs)              (Episode URLs)
-  |                                |
-  | 6a. CF Worker consumes         | 6b. EC2 Fleet consumes
-  v                                v
-[ cf-downloader ]           [ downloader.py ]
-  |                                |
-  | 7a. Streams audio to R2        | 7b. Streams audio to S3
-  v                                v
-[ Cloudflare R2 ]           [ AWS S3 ]
-(Final Storage)             (Final Storage)
+[ Cloudflare Queue ]                         [ Postgres DB ]
+(Episode URLs)
+      |
+      | 4. CF Worker consumes
+      v
+[ cf-downloader ]
+      |
+      | 5. Streams audio to R2
+      v
+[ Cloudflare R2 ]
+(Final Storage)
 ```
+
+### Optional: Amazon S3 download script
+
+If you prefer to download to Amazon S3 instead of R2, there is a simple legacy script you can use:
+
+- Script: `src/downloading/podcastindex/downloader.py`
+- Expected input: episode URLs via an AWS SQS queue
+- Required env vars: `SQS_QUEUE_URL`, `S3_BUCKET_NAME`, and standard AWS credentials
+
+Note: This path is not part of the main pipeline. You would need to route episode URLs to SQS yourself and manage S3 storage/reset independently.
