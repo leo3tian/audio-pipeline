@@ -16,7 +16,7 @@ spec:
       - name: worker
         image: leofixie/gpu-worker:latest # Replace this with actual image name
         env:
-        - { name: WORKER_BUCKET, value: "youtube-dataset-west" }
+        - { name: WORKER_BUCKET, value: "emilia-processing-logs" }
         - { name: BATCH_SIZE, value: "40" }
         - { name: WORKERS_PER_GPU, value: "3" }
         - { name: AWS_REGION, value: "us-west-1" }
@@ -37,6 +37,7 @@ spec:
         - { name: AWS_SECRET_ACCESS_KEY, value: "..." }
         - { name: HF_TOKEN, value: "..." }
         command: ["bash","-lc"]
+# The trap is used to upload the log file to S3
         args:
         - |
           source /opt/conda/etc/profile.d/conda.sh

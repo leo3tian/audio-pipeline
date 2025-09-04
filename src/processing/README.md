@@ -17,7 +17,11 @@ High level steps:
 
 ### 1. Download models
 
-Download sig_bak_ovr.onnx and UVR-MDX-NET-Inst_HQ_3.onnx into Emilia/models and update their path (if needed) in Emilia/config
+Manually download the checkpoints of UVR-MDX-NET-Inst_HQ_3 ([UVR-MDX-NET-Inst_3.onnx](https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Inst_HQ_3.onnx)) and DNSMOS P.835 ([sig_bak_ovr.onnx](https://github.com/microsoft/DNS-Challenge/blob/master/DNSMOS/DNSMOS/sig_bak_ovr.onnx))
+
+Update their path (if needed) in Emilia/config.json
+
+The checkpoints of Silero and Whisperx-medium will be downloaded automatically on the pipeline's first run.
 
 ### 2. Build docker image
 
@@ -57,7 +61,7 @@ export MAX_GPUS=8
 
 For kubernetes config files, check out /examples/. I run these by doing `kubectl apply -f emiliapipe.yaml`:
 - `emiliapipe.yaml` starts a kubernetes deployment that runs the GPU processing script (designed for H100s but tunable)
-- `autokicker.yaml` is a kubernetes deployment for monitors the emiliapipe deployment and letting other jobs run first, before . It was made to kick off emiliapipe pods when other pods need to run, so other team members can use GPUs without being blocked by the emiliapipe jobs. This is working as intended when:
+- `autokicker.yaml` is a kubernetes deployment for monitors the namespace, scaling emiliapipe when nodes are available. It was made to kick off emiliapipe pods when other pods need to run, so other team members can use GPUs without being blocked by the emiliapipe jobs. This is working as intended when:
     - There are no emiliapipe pods when other pods are pending
     - Otherwise, there should always be any amount of emiliapipe pods running and exactly one emiliapipe pod pending (this pending pod is how the script knows when to stop adding emiliapipe pods)
 
@@ -75,7 +79,7 @@ docker run --rm -it \
 ```
 
 ## Notes
-This codebase contains Emilia-Pipe, but with a few key changes:
+This codebase contains Emilia-Pipe, but a few key changes were made:
 - Long‑running workers instead of one‑shot scripts: models are loaded once and many episodes are processed per node. Orchestration via `src/processing/gpu_worker.py` replaces the vendor `Emilia/main_multi.py` for our use case.
 - Performance and stability knobs: added environment variables to control memory/throughput (e.g., `SEPARATION_CHUNKS`, ORT CUDA limits), chunked source separation with overlap, soxr‑based resampling (44.1k/16k where needed), and multi‑threaded MP3 export; each worker pins to a specific GPU device.
 - DNSMOS filtering removed from outputs: we still compute DNSMOS for analysis, but we don’t drop segments by score; uploads use `all_segments.json` so the research team receives the full dataset.
